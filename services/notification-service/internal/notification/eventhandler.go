@@ -46,7 +46,7 @@ func EventHandler(svc *services.Service) events.Handler {
 			title, body := orderCopy(e.Type, oe)
 			return create(ctx, svc, oe.CustomerID, oe.TenantID, e.Type, title, body, e.Data)
 
-		case events.PaymentCaptured, events.PaymentRefunded:
+		case events.PaymentCaptured, events.PaymentFailed, events.PaymentRefunded:
 			var pe paymentEvent
 			if err := e.Into(&pe); err != nil {
 				return err
@@ -98,8 +98,11 @@ func orderCopy(eventType string, oe orderEvent) (title, body string) {
 }
 
 func paymentCopy(eventType string) (title, body string) {
-	if eventType == events.PaymentRefunded {
+	switch eventType {
+	case events.PaymentRefunded:
 		return "Payment refunded", "Your payment has been refunded."
+	case events.PaymentFailed:
+		return "Payment failed", "Your payment could not be completed. Please try again."
 	}
 	return "Payment received", "We've received your payment. Thank you!"
 }

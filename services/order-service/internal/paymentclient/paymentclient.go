@@ -70,6 +70,13 @@ func (c *Client) Settle(ctx context.Context, tenantID, paymentID uuid.UUID) (*Pa
 		fmt.Sprintf("/api/v1/internal/tenants/%s/payments/%s/settle", tenantID, paymentID), nil)
 }
 
+// Cancel voids a payment that hasn't captured yet — called when an order is
+// cancelled while still PENDING_PAYMENT.
+func (c *Client) Cancel(ctx context.Context, tenantID, paymentID uuid.UUID) (*Payment, error) {
+	return c.call(ctx, http.MethodPost,
+		fmt.Sprintf("/api/v1/internal/tenants/%s/payments/%s/cancel", tenantID, paymentID), nil)
+}
+
 // Refund reverses a payment. amountCents nil = full refund; a value = partial.
 func (c *Client) Refund(ctx context.Context, tenantID, paymentID uuid.UUID, amountCents *int64) (*Payment, error) {
 	var body []byte

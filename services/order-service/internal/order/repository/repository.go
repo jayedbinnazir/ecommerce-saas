@@ -66,8 +66,10 @@ func scanItem(row platform.Scanner) (*domain.Item, error) {
 }
 
 // Create inserts the order and every line in one transaction. Items go in with a
-// single multi-row INSERT — never one statement per line.
-func (r *Repository) Create(ctx context.Context, o *domain.Order, items []domain.Item) error {
+// single multi-row INSERT — never one statement per line. If redeem is given it
+// runs inside the same transaction, after the insert; returning an error from
+// it rolls the order back too (see the domain.Repository doc comment).
+func (r *Repository) Create(ctx context.Context, o *domain.Order, items []domain.Item, redeem func(tx *sql.Tx) error) error {
 	return platform.RunInTx(ctx, r.db, func(tx *sql.Tx) error {
 		const q = `
 			INSERT INTO orders (
@@ -104,8 +106,14 @@ func (r *Repository) Create(ctx context.Context, o *domain.Order, items []domain
 			INSERT INTO order_items
 				(order_id, product_id, sku, quantity, unit_price_cents, currency, product_name, variant_title)
 			VALUES ` + strings.Join(valueRows, ",")
-		_, err = tx.ExecContext(ctx, ins, args...)
-		return err
+		if _, err = tx.ExecContext(ctx, ins, args...); err != nil {
+			return err
+		}
+
+		if redeem != nil {
+			return redeem(tx)
+		}
+		return nil
 	})
 }
 
@@ -223,61 +231,72 @@ func (r *Repository) ItemsByOrderIDs(ctx context.Context, orderIDs []uuid.UUID) 
 	return out, rows.Err()
 }
 
-func (r *Repository) AttachPayment(ctx context.Context, id, paymentID uuid.UUID, method domain.Method) error {
+func (r *Repository) AttachPayment(ctx context.Context, tenantID, id, paymentID uuid.UUID, method domain.Method) error {
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE orders SET payment_id = $2, payment_method = $3 WHERE id = $1`, id, paymentID, string(method))
+		UPDATE orders SET payment_id = $3, payment_method = $4 WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID, paymentID, string(method))
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrOrderNotFound)
 }
 
-func (r *Repository) MarkConfirmed(ctx context.Context, id uuid.UUID) error {
+func (r *Repository) MarkConfirmed(ctx context.Context, tenantID, id uuid.UUID) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE orders SET status = 'CONFIRMED'
-		WHERE id = $1 AND status = 'PENDING_PAYMENT'`, id)
+		WHERE id = $1 AND tenant_id = $2 AND status = 'PENDING_PAYMENT'`, id, tenantID)
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrInvalidTransition)
 }
 
-func (r *Repository) MarkPaymentPaid(ctx context.Context, id uuid.UUID) error {
+func (r *Repository) MarkPaymentPaid(ctx context.Context, tenantID, id uuid.UUID) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE orders SET payment_status = 'PAID', paid_at = now()
-		WHERE id = $1 AND payment_status = 'PENDING'`, id)
+		WHERE id = $1 AND tenant_id = $2 AND payment_status = 'PENDING'`, id, tenantID)
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrInvalidTransition)
 }
 
-func (r *Repository) MarkPaymentRefunded(ctx context.Context, id uuid.UUID) error {
+func (r *Repository) MarkPaymentFailed(ctx context.Context, tenantID, id uuid.UUID) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE orders SET payment_status = 'FAILED'
+		WHERE id = $1 AND tenant_id = $2 AND payment_status = 'PENDING'`, id, tenantID)
+	if err != nil {
+		return err
+	}
+	return platform.AffectedOrNotFound(res, domain.ErrInvalidTransition)
+}
+
+func (r *Repository) MarkPaymentRefunded(ctx context.Context, tenantID, id uuid.UUID) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE orders SET payment_status = 'REFUNDED'
-		WHERE id = $1 AND payment_status = 'PAID'`, id)
+		WHERE id = $1 AND tenant_id = $2 AND payment_status = 'PAID'`, id, tenantID)
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrInvalidTransition)
 }
 
-func (r *Repository) MarkFulfilled(ctx context.Context, id uuid.UUID, carrier, trackingNumber *string) error {
+func (r *Repository) MarkFulfilled(ctx context.Context, tenantID, id uuid.UUID, carrier, trackingNumber *string) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE orders
 		SET status = 'FULFILLED', fulfilled_at = now(),
-		    tracking_carrier = $2, tracking_number = $3
-		WHERE id = $1 AND status = 'CONFIRMED'`, id, carrier, trackingNumber)
+		    tracking_carrier = $3, tracking_number = $4
+		WHERE id = $1 AND tenant_id = $2 AND status = 'CONFIRMED'`, id, tenantID, carrier, trackingNumber)
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrInvalidTransition)
 }
 
-func (r *Repository) MarkCancelled(ctx context.Context, id uuid.UUID) error {
+func (r *Repository) MarkCancelled(ctx context.Context, tenantID, id uuid.UUID) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE orders SET status = 'CANCELLED', cancelled_at = now()
-		WHERE id = $1 AND status IN ('PENDING_PAYMENT', 'CONFIRMED')`, id)
+		WHERE id = $1 AND tenant_id = $2 AND status IN ('PENDING_PAYMENT', 'CONFIRMED')`, id, tenantID)
 	if err != nil {
 		return err
 	}

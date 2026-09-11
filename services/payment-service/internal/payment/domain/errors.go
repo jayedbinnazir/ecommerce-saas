@@ -9,6 +9,7 @@ var (
 	ErrInvalidAmount   = errors.New("payment amount must be positive")
 	ErrNotRefundable   = errors.New("only a captured payment can be refunded")
 	ErrNotSettleable   = errors.New("only a pending cash-on-delivery payment can be settled")
+	ErrNotCancellable  = errors.New("only a pending payment can be cancelled")
 	ErrNotOwner        = errors.New("this payment belongs to another customer")
 	ErrManagerOnly     = errors.New("only a tenant ADMIN or MANAGER can view this")
 )

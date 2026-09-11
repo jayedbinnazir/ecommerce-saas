@@ -22,7 +22,7 @@ import (
 //   - POST /webhooks/stripe                                 Stripe (signature-verified)
 //   - /internal/tenants/:tenantId/payments[...]             order-service (X-Internal-Key)
 func Register(rg *gin.RouterGroup, db *sql.DB, gw gateway.Gateway, publisher *events.Publisher, authzClient *authz.Client, guards httpx.Guards, internalKey string) {
-	svc := services.New(repository.New(db), gw, publisher, authzClient)
+	svc := services.New(db, repository.New(db), gw, publisher, authzClient)
 	h := httphandler.New(svc, gw)
 
 	read := rg.Group("/tenants/:tenantId", guards.Authenticated)
@@ -38,6 +38,7 @@ func Register(rg *gin.RouterGroup, db *sql.DB, gw gateway.Gateway, publisher *ev
 		internal.POST("", h.CreatePayment)
 		internal.POST("/:paymentId/sync", h.Sync)
 		internal.POST("/:paymentId/settle", h.Settle)
+		internal.POST("/:paymentId/cancel", h.Cancel)
 		internal.POST("/:paymentId/refund", h.Refund)
 	}
 }

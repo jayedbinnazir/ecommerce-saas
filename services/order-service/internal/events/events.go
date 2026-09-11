@@ -28,6 +28,7 @@ const (
 	OrderShipped    = "order.shipped"    // fulfilled
 	OrderCancelled  = "order.cancelled"  // cancelled, stock released
 	PaymentCaptured = "payment.captured" // money received
+	PaymentFailed   = "payment.failed"   // card declined / canceled
 	PaymentRefunded = "payment.refunded" // captured payment reversed
 )
 

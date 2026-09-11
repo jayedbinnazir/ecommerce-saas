@@ -170,13 +170,42 @@ func (r *Repository) ItemsByReturnIDs(ctx context.Context, returnIDs []uuid.UUID
 	return out, rows.Err()
 }
 
-func (r *Repository) Resolve(ctx context.Context, id uuid.UUID, status domain.Status, note *string, refundCents int64, restocked bool) error {
+func (r *Repository) Resolve(ctx context.Context, tenantID, id uuid.UUID, status domain.Status, note *string, refundCents int64, restocked bool) error {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE order_returns
-		SET status = $2, resolution_note = $3, refund_cents = $4, restocked = $5, resolved_at = now()
-		WHERE id = $1 AND status = 'REQUESTED'`, id, status, note, refundCents, restocked)
+		SET status = $3, resolution_note = $4, refund_cents = $5, restocked = $6, resolved_at = now()
+		WHERE id = $1 AND tenant_id = $2 AND status = 'REQUESTED'`,
+		id, tenantID, status, note, refundCents, restocked)
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrAlreadyResolved)
+}
+
+// AlreadyReturnedBySKU sums the quantity every REQUESTED or COMPLETED return on
+// this order has already claimed, per SKU, in one query. A REJECTED return's
+// items don't count — rejecting one frees that quantity back up.
+func (r *Repository) AlreadyReturnedBySKU(ctx context.Context, orderID uuid.UUID) (map[string]int, error) {
+	out := make(map[string]int)
+	const q = `
+		SELECT ri.sku, COALESCE(SUM(ri.quantity), 0)
+		FROM order_return_items ri
+		JOIN order_returns rt ON rt.id = ri.return_id
+		WHERE rt.order_id = $1 AND rt.status IN ('REQUESTED', 'COMPLETED')
+		GROUP BY ri.sku`
+	rows, err := r.db.QueryContext(ctx, q, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sku string
+		var qty int
+		if err := rows.Scan(&sku, &qty); err != nil {
+			return nil, err
+		}
+		out[strings.ToLower(sku)] = qty
+	}
+	return out, rows.Err()
 }

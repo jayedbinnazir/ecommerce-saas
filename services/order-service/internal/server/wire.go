@@ -30,7 +30,7 @@ func (s *Server) registerModules(api *gin.RouterGroup) error {
 	storeCfg := storeconfig.New(storeconfigrepo.New(s.db))
 	storeconfigroutes.Register(api, storeCfg, guards)
 
-	orderroutes.Register(api, s.db, cartClient, inventoryClient, paymentClient, storeCfg, s.events, authzClient, guards)
+	s.orderSvc = orderroutes.Register(api, s.db, cartClient, inventoryClient, paymentClient, storeCfg, s.events, authzClient, guards)
 	returnroutes.Register(api, s.db, paymentClient, inventoryClient, authzClient, guards)
 
 	return nil

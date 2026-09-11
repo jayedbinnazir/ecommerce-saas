@@ -50,6 +50,11 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 func (h *Handler) Sync(c *gin.Context)   { h.internalTransition(c, h.svc.Sync) }
 func (h *Handler) Settle(c *gin.Context) { h.internalTransition(c, h.svc.Settle) }
 
+// Cancel — POST /internal/tenants/:tenantId/payments/:paymentId/cancel
+// Voids a payment that hasn't captured yet (order-service calls this when an
+// order is cancelled while still PENDING_PAYMENT).
+func (h *Handler) Cancel(c *gin.Context) { h.internalTransition(c, h.svc.Cancel) }
+
 // Refund — POST /internal/tenants/:tenantId/payments/:paymentId/refund
 // Optional body { "amount_cents": N } for a partial refund; omit for a full one.
 func (h *Handler) Refund(c *gin.Context) {

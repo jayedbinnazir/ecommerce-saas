@@ -523,3 +523,431 @@ recreated (not just restarted) so they pick up `.env.dev`:
 ```
 docker compose --env-file .env.dev -f deployments/compose/docker-compose.dev.yml up -d mail-service payment-service
 ```
+
+---
+
+## Gap-analysis fixes — implementation + real API verification (2026-09-11)
+
+Full write-up of the gaps: `ApiTestResults/GAP_ANALYSIS.md`. This section implements
+and **exercises through the real Dockerized services** the P0 and P1 items from
+that report. No new `*_test.go` files — every check below is a real HTTP call
+(or a validly-signed simulated Stripe webhook, since there's no way to drive a
+real card confirmation headlessly) against the running containers, with the
+actual response and the actual database/Kafka-driven side effect captured.
+
+Webhook simulation method: payment-service verifies `Stripe-Signature` with
+`HMAC-SHA256(webhook_secret, "{timestamp}.{payload}")` (`internal/gateway/gateway.go`).
+A small script signs a payload with the real `PAYMENT_STRIPE_WEBHOOK_SECRET` the
+same way and POSTs it to `POST /api/v1/webhooks/stripe` — this exercises the
+actual signature-verification and event-processing code, it just stands in for
+Stripe's own delivery (the PaymentIntent itself is real — `payment-service`
+calls the real Stripe test-mode API to create it during checkout).
+
+### P0.1 — Stripe webhook → order synchronization
+
+**Root cause:** `payment-service` published `payment.captured` to Kafka, but
+`order-service` had no consumer for it (the `events.Consumer` type existed,
+unused). An order only ever moved off `PENDING_PAYMENT` when a client called
+`POST /orders/:id/pay` again.
+
+**Fix:** `order-service` gained a `payment-events` Kafka consumer
+(`internal/order/eventhandler.go`, wired in `internal/server/server.go`) that
+calls two new idempotent service methods, `ApplyPaymentCaptured` /
+`ApplyPaymentFailed` (`internal/order/services/service.go`), mirroring the
+existing mail-service/notification-service consumer pattern.
+
+**Files changed:** `order-service/internal/events/events.go` (+`PaymentFailed`
+const), `internal/order/eventhandler.go` (new), `internal/order/services/service.go`,
+`internal/order/domain/order.go`, `internal/order/repository/repository.go`,
+`internal/order/routes/routes.go` (now returns the wired `*services.Service`),
+`internal/server/{server.go,shutdown.go,wire.go}`. Same `payment.failed` const
+added to payment-service/mail-service/notification-service's copies of
+`internal/events/events.go` for consistency (mail/notification already had
+handling wired in this pass too — see P0.2).
+
+**Test — checkout → pay → simulated `payment_intent.succeeded` webhook, no second `Pay()` call:**
+
+Request (checkout, then `POST /orders/:id/pay {"payment_method":"CARD"}`, then the signed webhook):
+```
+POST /api/v1/webhooks/stripe
+Stripe-Signature: t=<ts>,v1=<hmac>
+{"type":"payment_intent.succeeded","data":{"object":{"id":"pi_3UERiJBPQJ9jcRLH2Knrw03L"}}}
+```
+Response: `200`, empty body.
+
+Order **before** the webhook: `status=PENDING_PAYMENT payment_status=PENDING`.
+Order **after** the webhook (no `Pay()` call in between): `status=CONFIRMED payment_status=PAID paid_at=2026-09-11T10:29:50.812577Z`.
+
+Notifications created (Kafka-driven, via the new consumer):
+```
+order.confirmed  Order confirmed
+payment.captured Payment received
+order.placed     Order placed
+```
+Mailpit: `Order c4f1c7c1 received`, `Receipt for order c4f1c7c1`.
+
+**PASS** — the order is fully synced from the webhook alone.
+
+### P0.2 — Failed CARD payment releases the inventory reservation
+
+**Root cause:** `Pay()` handled `payment.Status == "CAPTURED"` but had no branch
+for `"FAILED"` — a declined/cancelled card left the checkout-time reservation
+in place forever, with no automatic path back to available stock.
+
+**Fix:** `releaseOnPaymentFailure` (`order/services/service.go`) — marks
+`payment_status='FAILED'` via a new, guarded `MarkPaymentFailed` repo method
+(no-ops once payment_status has moved off `PENDING`, so it can't double-fire),
+then releases the reservation. Called from both the synchronous `Pay()` path
+(`payment.Status == "FAILED"`) and the new async `ApplyPaymentFailed` Kafka path
+(P0.1), so a decline is caught however it's discovered.
+
+**Test — checkout (qty 2) → CARD → simulated `payment_intent.payment_failed` webhook:**
+
+```
+inventory BEFORE:               on_hand 29  reserved 0  available 29
+checkout (qty 2) reserves:      on_hand 29  reserved 2  available 27
+webhook payment_intent.payment_failed  -> HTTP 200
+order after:                    status=PENDING_PAYMENT  payment_status=FAILED
+inventory after (RELEASED):     on_hand 29  reserved 0  available 29   ✅ back to baseline
+```
+
+**Duplicate failure delivery** (same signed payload posted twice) — inventory
+unchanged (`on_hand 29 reserved 0 available 29`), no double release.
+
+**Client re-syncs by calling `Pay()` again on the now-FAILED order** — `Sync()`
+short-circuits (`p.Status != Pending`), inventory still `reserved 0`, no
+double-release, order's `payment_status` stays `FAILED`.
+
+**PASS** — release happens exactly once regardless of how many times the
+failure is observed.
+
+### P0.3 — Payment webhook concurrency / idempotency
+
+**Root cause:** `HandleWebhook` did a plain `SELECT` (no lock) then a plain
+`UPDATE`. Two genuinely concurrent deliveries of the same event could both pass
+the "still PENDING" guard before either committed, both capture, both publish
+`payment.captured` — duplicate emails/notifications.
+
+**Fix:** `HandleWebhook` (`payment-service/internal/payment/services/service.go`)
+now runs the read-check-write inside one DB transaction with the payment row
+locked (`GetByGatewayRefForUpdate` — new repo method, `SELECT ... FOR UPDATE`,
+same pattern inventory-service already used for stock). The Kafka publish only
+happens after the transaction commits, and only on the delivery that actually
+changed something.
+
+**Test — 8 truly concurrent identical webhook deliveries** (backgrounded curl,
+`wait`) for one freshly-created order:
+
+```bash
+for i in $(seq 1 8); do curl ... -d "$PAYLOAD" -H "Stripe-Signature: $SIG" & done; wait
+```
+All 8 responses: `200`.
+
+```
+payments row:   status=CAPTURED  captured_at=2026-09-11 10:30:52.635758+00  refunded_cents=0   (ONE row, ONE timestamp)
+notifications:  {'order.confirmed': 1, 'payment.captured': 1, 'order.placed': 1}                (exactly once each)
+mailpit:        "Receipt for order db8abb0d", "Order db8abb0d received"                          (exactly 2 messages, not 16)
+```
+
+**PASS** — proven under real concurrent load, not just sequential retries.
+
+### P1.4 — Coupon redemption consistency
+
+**Root cause:** `RedeemCoupon` ran *after* the order was already committed with
+the discount applied, and its error was only logged — a failed redemption
+(e.g. lost the race against `max_redemptions`) left the order discounted with
+the coupon's counter never incremented.
+
+**Fix:** `order/repository.Repository.Create` now takes an optional `redeem
+func(tx *sql.Tx) error` that runs **inside the same transaction** as the order
++ items insert (`internal/order/services/service.go` `Checkout`,
+`internal/order/repository/repository.go`, `internal/order/domain/order.go`).
+A failed redemption rolls the whole order back — no discount without a real,
+committed redemption, and vice versa.
+
+**Test — sequential exhaustion**, coupon `ONEUSE` (`max_redemptions=1`):
+
+```
+1st checkout with ONEUSE:  {"status":"success","data":{"discount_cents":500}}
+coupon state after:        {"code":"ONEUSE","max_redemptions":1,"redeemed_count":1}
+
+2nd checkout with ONEUSE:  {"status":"error","error":{"code":"VALIDATION_ERROR",
+                             "message":"that coupon has reached its redemption limit"}}
+coupon state after:        {"code":"ONEUSE","max_redemptions":1,"redeemed_count":1}   <- unchanged, no phantom order
+```
+
+**Test — 6-way concurrent redemption race**, fresh coupon `RACE1` (`max_redemptions=1`),
+6 different customers checking out simultaneously with it:
+
+```sql
+select count(*) from orders where coupon_code='RACE1';   -- 1
+select redeemed_count from coupons where code='RACE1';   -- 1
+```
+
+**PASS** — exactly one of the six concurrent attempts succeeded; the coupon's
+counter and the actual order count agree under real concurrency, both capped at 1.
+
+### P1.5 — Duplicate / over-return quantity prevention
+
+**Root cause:** `Request()` validated a return's quantity only against the
+*original* order line quantity, never against quantity already covered by a
+REQUESTED or COMPLETED return on the same order — a SKU could be "returned"
+past what was actually ordered.
+
+**Fix:** new batched repo method `AlreadyReturnedBySKU` (one query, sums
+non-rejected return items per SKU for the order) called once per `Request()`
+(`internal/returns/repository/repository.go`,
+`internal/returns/services/service.go`), plus a new domain error
+`ErrReturnQuantityExceeded`. A REJECTED return's quantity is excluded from the
+sum, so rejecting one frees its quantity back up.
+
+**Test — order of 3× `S99-8`, fulfilled:**
+
+```
+1) return qty 1 (of 3)                    -> success -> manager approves -> COMPLETED, refund 89900
+2) return qty 3 (only 2 left)             -> 422 VALIDATION_ERROR "that quantity has already been returned or is pending return"
+3) return qty 2 (exactly what's left)     -> success (status REQUESTED, not yet resolved)
+4) return qty 1 more (nothing left, even  -> 422 VALIDATION_ERROR (same message) -- pending REQUESTED already counts
+   though #3 is only REQUESTED, not COMPLETED)
+5) manager REJECTS return #3              -> REJECTED
+6) return qty 2 again after the rejection -> success (rejected quantity correctly freed back up)
+```
+
+**PASS** — every one of the required edge cases (duplicate request, over-limit,
+remaining-exact, pending-counts-too, rejection-frees-it-back-up) behaves correctly.
+
+### P1.6 — Tenant-scoping hardening
+
+**Root cause:** ~12 repository mutation methods across order/payment/product/user-management
+filtered by `id` only, not `tenant_id + id` — the security audit found **no live
+exploit** (every call site already re-verified tenant ownership in the service
+layer first), but the SQL itself provided no independent defense.
+
+**Fix:** added `tenant_id` (or `product_id`, for the tables that don't carry a
+tenant column) to the WHERE clause of every flagged method: order-service's
+`AttachPayment/MarkConfirmed/MarkPaymentPaid/MarkPaymentFailed/MarkPaymentRefunded/
+MarkFulfilled/MarkCancelled` and `order_returns.Resolve`; payment-service's
+`payments.Update`; product-service's `product_variants.GetByID/Update/Delete/
+ClearDefault` and `product_images.GetByID/Update/Delete`; user-management's
+`memberships.UpdateRole/Delete`. Since these were never independently
+reachable, there is no black-box HTTP scenario that shows *new* rejection
+behavior — the correct check was already there one layer up. What real API
+tests can and do confirm: same-tenant operations still work (no regression from
+adding the WHERE clause) and cross-tenant access is still blocked exactly as
+before.
+
+**Test:**
+```
+PATCH /tenants/{TENANT_A}/products/{P}/variants/{V}  (Bearer: Tenant A admin, own variant)
+  -> 200 {"status":"success","data":{"barcode":"REGCHECK123", ...}}                  regression check: PASS
+
+Tenant B created fresh (register -> subscribe -> create tenant) to confirm the
+subscription-gate + auto-ADMIN-membership business rules still hold:
+  -> 201, new tenant id, Tenant B's owner is auto-ADMIN
+
+PATCH /tenants/{TENANT_A}/products/{P}/variants/{V}  (Bearer: Tenant B admin)
+  -> 403 {"status":"error","error":{"code":"FORBIDDEN","message":"you are not a member of this tenant"}}
+
+GET .../products/{P} as Tenant A admin afterward -> barcode still "REGCHECK123" (untouched by the blocked attempt)
+```
+
+**PASS** — no regression on legitimate same-tenant writes; cross-tenant access
+remains correctly blocked; the subscription→tenant-creation→auto-ADMIN business
+rule is intact.
+
+### Build/runtime verification
+
+All 8 services: `gofmt -l` clean, `go build ./...` clean, `go vet ./...` clean
+(no test files added or changed). Recreated the 5 touched containers
+(`order-service`, `payment-service`, `product-service`, `user-management`,
+`notification-service`) and confirmed clean boot logs — `order-service
+consuming payment-events` (new consumer active), zero panics/fatals across all
+five services' logs for the full test session.
+
+### Remaining from GAP_ANALYSIS.md (not implemented this pass)
+
+Password reset / change-password flow (new feature, no existing scaffold to
+extend), cross-service session revocation (architecture trade-off — needs your
+call), subscription renewal / ongoing enforcement (needs your call on scope),
+product hard-delete guard, review purchase-eligibility (needs a cross-service
+design decision), per-user coupon limit, Kafka DLQ, `PARTIALLY_REFUNDED`
+order-payment-status — all still open, see `GAP_ANALYSIS.md` §8 for the full
+list and reasoning. `order-cancel-voids-pending-PaymentIntent` is now
+implemented — see the next section.
+
+---
+
+## Order cancellation lifecycle — implementation + real API verification (2026-09-11)
+
+Built on top of the payment webhook work above (webhook → order sync, the
+concurrency-safe `HandleWebhook`, and idempotent `ApplyPaymentCaptured`/
+`ApplyPaymentFailed`). Cancellation itself (`POST /orders/:id/cancel`) already
+existed and worked — this pass closes the one real gap: **a delayed Stripe
+capture landing after the order was already cancelled must never resurrect
+it**, plus adds voiding the pending Stripe PaymentIntent at cancel time so
+that race is rare in the first place, not just survivable.
+
+### What was already there (inspected, not rebuilt)
+
+- `POST /tenants/:tenantId/orders/:orderId/cancel` — `guards.Authenticated`,
+  owner-or-manager enforced inside the service (`load()`).
+- `MarkCancelled` (`order/repository/repository.go`) is DB-state-guarded:
+  `WHERE status IN ('PENDING_PAYMENT','CONFIRMED')` — so FULFILLED and
+  already-CANCELLED orders are rejected at the SQL layer, not by an
+  if/else chain in Go. This is the state machine; nothing new was invented.
+- Inventory release, refund-if-captured, and the `order.cancelled` Kafka event
+  all already existed and were unchanged.
+
+### What was missing and got implemented
+
+**1. Void the pending Stripe PaymentIntent at cancel time.** `Cancel()`
+(`order/services/service.go`) gained a second branch alongside the existing
+"refund if already PAID" one: if the payment is CARD and still PENDING, it
+calls a new payment-service endpoint to cancel the PaymentIntent — best
+effort, same style as the existing refund call (log and continue, don't fail
+the cancellation over it).
+
+New payment-service capability (mirrors the existing `Refund`/`Settle` shape
+exactly): `Gateway.Cancel` (`internal/gateway/gateway.go`, real Stripe →
+`POST /payment_intents/:id/cancel`; stub → no-op), `Service.Cancel`
+(`internal/payment/services/service.go`, only a `PENDING` payment can be
+cancelled — `ErrNotCancellable` otherwise), handler + route
+`POST /internal/tenants/:tenantId/payments/:paymentId/cancel`, and a matching
+`paymentclient.Cancel` in order-service.
+
+**2. `ApplyPaymentCaptured` must not resurrect a cancelled order.** Before this
+pass it only handled `PENDING_PAYMENT`/`CONFIRMED`. It now switches on the
+order's actual status: for `CANCELLED`, it never calls `advanceToConfirmed` —
+instead it records the real capture (`MarkPaymentPaid`, best effort) and
+immediately reverses it through the **existing** refund path
+(`s.payments.Refund`, the same call `Cancel()` itself uses for an
+already-paid order) — same mechanism as a manager refunding a paid order, not
+a new workflow. `FULFILLED` is a no-op (already fully settled).
+
+**3. `ApplyPaymentFailed`/`releaseOnPaymentFailure` must not double-release
+inventory.** It now re-checks the order's status before releasing: only a
+still-`PENDING_PAYMENT` order gets its stock released here. An already-
+`CANCELLED` order's stock was released by `Cancel()` itself — releasing again
+would double-release the same units back into `available`.
+
+**Files changed:** `payment-service/internal/{gateway/gateway.go,
+payment/{domain/{payment.go,errors.go},services/service.go,
+handler/http/handler.go,routes/routes.go},httpx/errors.go}`;
+`order-service/internal/{paymentclient/paymentclient.go,
+order/services/service.go}`. No migrations needed (no new DB columns; the
+payment reuses its existing `FAILED` status for "voided, never captured").
+
+### Test 1 — COD order cancellation
+
+```
+inventory before checkout:  on_hand 47 reserved 8  available 39
+checkout (qty 1):           on_hand 47 reserved 9  available 38
+pay COD:                    order status=CONFIRMED payment_status=PENDING
+POST .../cancel:            200 {"status":"CANCELLED", "payment_status":"PENDING", "cancelled_at":"..."}
+inventory after cancel:     on_hand 47 reserved 8  available 39   <- back to baseline
+duplicate POST .../cancel:  409 CONFLICT "the order cannot move to that state from its current one"
+inventory after duplicate:  on_hand 47 reserved 8  available 39   <- unchanged, no double release
+```
+**PASS** — COD payment_status correctly stays PENDING (nothing was ever
+collected), inventory releases exactly once, duplicate cancel is safely
+rejected.
+
+### Test 2 — CARD, still PENDING_PAYMENT, cancel voids the PaymentIntent (the common case)
+
+```
+checkout + pay CARD:        order PENDING_PAYMENT, payment PENDING, gateway_ref=pi_3UESAu...
+inventory after reserve:    reserved 9  available 38
+POST .../cancel:            200 {"status":"CANCELLED", "payment_status":"PENDING", ...}
+payments row after cancel:  status=FAILED  (our Cancel() successfully voided the real Stripe test-mode PaymentIntent)
+inventory after cancel:     reserved 8  available 39   <- released
+```
+
+**The race — delayed webhook after cancellation, must not resurrect:**
+```
+POST /api/v1/webhooks/stripe  {"type":"payment_intent.succeeded", ...same gateway_ref...}
+  -> HTTP 200 (payment-service's own guard: status is already FAILED, not
+     PENDING, so HandleWebhook no-ops it before it ever reaches order-service)
+order after the delayed webhook:  status=CANCELLED  payment_status=PENDING   <- unchanged
+inventory after the delayed webhook: reserved 8  available 39                 <- unchanged
+duplicate delivery of the same delayed webhook: HTTP 200, order state stable
+```
+**PASS** — voiding at cancel time means the natural case never even reaches
+the order-side race logic; the order simply never moves.
+
+### Test 3 — the hard race: void itself gets rejected, capture lands anyway
+
+Simulated by pointing the payment's `gateway_ref` at a nonexistent PaymentIntent
+id right before cancelling, so payment-service's real Stripe void call 404s and
+the payment is left `PENDING` — the state a genuine "Stripe already captured a
+moment before the cancel" race would also leave it in.
+
+```
+cancel (void rejected by Stripe, logged, order still cancels): HTTP 200
+state right after:            order status=CANCELLED  payment_status=PENDING (still)
+                               payments row: status=PENDING refunded_cents=0
+delayed payment_intent.succeeded webhook (same fake gateway_ref):  HTTP 200
+order AFTER the late capture:  status=CANCELLED  payment_status=PAID   <- captured recorded, but NOT resurrected
+```
+The subsequent auto-refund call to real Stripe then 404s too — because
+nothing in this sandbox ever drives a genuine Stripe card confirmation, *no*
+PaymentIntent used anywhere in this test session is ever really captured at
+Stripe, so a real refund call on one always fails the same way (confirmed in
+payment-service's own log: `stripe POST /refunds: status 404: resource
+missing`). That's a sandbox limitation, not a code defect — retried 3x by the
+Kafka consumer, then logged and dropped, **and critically the order stayed
+CANCELLED throughout**, which is the property that actually matters.
+
+To confirm the refund *wiring* itself (not the Stripe network call) is
+correct, the same race was repeated with the payment's `method` flipped to
+`COD` in the DB right before the delayed webhook fires — `Refund()` only calls
+Stripe for CARD, so this isolates the application logic from the Stripe call:
+```
+order after the late capture:  status=CANCELLED  payment_status=REFUNDED
+payments row:                  status=REFUNDED  amount_cents=97092  refunded_cents=97092
+notifications:                 payment.refunded - Payment refunded
+                                payment.captured - Payment received
+                                order.cancelled  - Order cancelled
+```
+**PASS** — order never resurrected in either variant; with a refundable
+payment object, the full "capture recorded → auto-refunded → notified" chain
+completes correctly and reuses the existing refund + notification pipeline.
+
+### Test 4 — CARD order already CONFIRMED + PAID → cancel → refund (existing path, unchanged)
+
+```
+checkout + pay CARD + normal (non-race) capture webhook:  status=CONFIRMED payment_status=PAID
+POST .../cancel:                                           200, status=CANCELLED
+```
+Refund is attempted via the same pre-existing `s.payments.Refund` call this
+feature didn't change; it 404s against real Stripe for the same "nothing was
+ever genuinely captured in this sandbox" reason as Test 3 — this is identical,
+unmodified behavior from before this pass, not a regression.
+**PASS** for the part in scope (cancel transitions correctly and attempts
+the existing refund path; no code in this area was changed).
+
+### Test 5 — invalid state: cancelling a FULFILLED order
+
+```
+checkout -> pay COD -> fulfil (DHL, tracking F1)
+POST .../cancel:  409 CONFLICT {"message":"the order cannot move to that state from its current one"}
+```
+**PASS** — DB state guard (`WHERE status IN ('PENDING_PAYMENT','CONFIRMED')`)
+rejects it, unchanged pre-existing behavior, confirmed still correct.
+
+### Test 6 — authorization
+
+```
+non-owner customer cancels someone else's order:      403 FORBIDDEN "only a tenant ADMIN or MANAGER can do that"
+a DIFFERENT tenant's admin cancels tenant A's order:   403 FORBIDDEN (same message — no membership in tenant A at all)
+the actual owner cancels their own eligible order:     200
+a tenant ADMIN cancels a customer's order in their own tenant: 200
+```
+**PASS** — ownership/manager boundary and tenant isolation both hold; the
+legitimate owner and seller-initiated paths aren't over-blocked.
+
+### Build/runtime verification
+
+`payment-service` + `order-service`: `gofmt -l` / `go build ./...` / `go vet
+./...` clean (no test files). Both containers force-recreated; confirmed clean
+boot (`order-service consuming payment-events`), zero panics/fatals across the
+full cancellation test session.
