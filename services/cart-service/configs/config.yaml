@@ -1,0 +1,25 @@
+server:
+  host: 0.0.0.0
+  port: "8080"
+  mode: release
+
+database:
+  host: localhost
+  port: "5432"
+  name: cart_db
+  dbssl: false
+  max_open_connections: 25
+  max_idle_connections: 10
+  connection_max_lifetime: 30m
+
+kafka:
+  brokers:
+    - localhost:9092
+
+jwt:
+  secret: "change-me-in-production"
+
+services:
+  user_service_url: "http://localhost:8081"
+  product_service_url: "http://localhost:8082"
+  inventory_service_url: "http://localhost:8083"

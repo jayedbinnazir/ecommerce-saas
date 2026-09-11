@@ -1,0 +1,28 @@
+.env
+.env.*
+!.env.example
+
+# Air development output
+tmp/
+
+# Go build and test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+coverage.out
+coverage.html
+vendor/
+
+# Logs (air writes build-errors.log)
+*.log
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

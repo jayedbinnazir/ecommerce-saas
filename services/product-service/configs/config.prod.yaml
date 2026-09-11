@@ -1,0 +1,6 @@
+server:
+  mode: release
+
+database:
+  max_open_connections: 50
+  max_idle_connections: 20

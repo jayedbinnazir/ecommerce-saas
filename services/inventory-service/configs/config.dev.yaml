@@ -1,0 +1,21 @@
+server:
+  host: 0.0.0.0
+  port: "8080"
+  mode: debug
+
+database:
+  host: postgres
+  port: "5432"
+  name: inventory_db
+
+kafka:
+  brokers:
+    - kafka:9092
+
+jwt:
+  secret: "change-this-in-development"
+
+services:
+  user_service_url: "http://user-management:8080"
+
+internal_key: "dev-internal-key"

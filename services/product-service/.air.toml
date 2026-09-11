@@ -1,0 +1,25 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  bin = "./tmp/main"
+  cmd = "go build -o ./tmp/main ./cmd/api"
+  delay = 1000
+  exclude_dir = ["assets", "tmp", "vendor", "testdata", "migrations"]
+  exclude_regex = ["_test.go"]
+  include_ext = ["go", "yaml"]
+  kill_delay = "500ms"
+  log = "build-errors.log"
+  poll = true
+  poll_interval = 500
+  stop_on_error = true
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true
+
+[screen]
+  clear_on_rebuild = true
+  keep_scroll = true

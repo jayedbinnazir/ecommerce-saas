@@ -1,0 +1,24 @@
+server:
+  host: 0.0.0.0
+  port: "8080"
+  mode: debug
+
+database:
+  host: postgres
+  port: "5432"
+  name: order_db
+
+kafka:
+  brokers:
+    - kafka:9092
+
+jwt:
+  secret: "change-this-in-development"
+
+services:
+  user_service_url: "http://user-management:8080"
+  cart_service_url: "http://cart-service:8080"
+  inventory_service_url: "http://inventory-service:8080"
+  inventory_internal_key: "dev-internal-key"
+  payment_service_url: "http://payment-service:8080"
+  payment_internal_key: "dev-internal-key"

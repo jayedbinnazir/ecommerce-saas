@@ -1,0 +1,27 @@
+server:
+  host: 0.0.0.0
+  port: "8080"
+  mode: debug
+
+database:
+  host: postgres
+  port: "5432"
+  name: mail_db
+
+kafka:
+  brokers:
+    - kafka:9092
+
+# Leave smtp.host empty for stub mode (mail is logged, not delivered).
+smtp:
+  host: ""
+  port: "587"
+  username: ""
+  password: ""
+  from: "Platform (dev) <no-reply@localhost>"
+
+services:
+  user_service_url: "http://user-management:8080"
+  user_internal_key: "dev-internal-key"
+
+internal_key: "dev-internal-key"
