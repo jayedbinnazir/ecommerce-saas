@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"time"
 
@@ -105,7 +106,12 @@ type ListFilter struct {
 }
 
 type Repository interface {
-	Create(ctx context.Context, o *Order, items []Item) error
+	// Create inserts the order and its items in one transaction. redeem, if
+	// non-nil, runs inside that same transaction (used to redeem a coupon
+	// atomically with the order write — see order/services.Checkout) so a
+	// failed redemption rolls the whole order back instead of leaving it
+	// discounted with the coupon's usage counter never incremented.
+	Create(ctx context.Context, o *Order, items []Item, redeem func(tx *sql.Tx) error) error
 	GetByID(ctx context.Context, tenantID, id uuid.UUID) (*Order, error)
 	// GetByIdempotencyKey returns a prior checkout for the same key, or
 	// ErrOrderNotFound. Used to make POST /orders safe to retry.
@@ -115,10 +121,18 @@ type Repository interface {
 	ItemsByOrderIDs(ctx context.Context, orderIDs []uuid.UUID) (map[uuid.UUID][]Item, error)
 
 	// AttachPayment records which payment-service payment covers this order.
-	AttachPayment(ctx context.Context, id, paymentID uuid.UUID, method Method) error
-	MarkConfirmed(ctx context.Context, id uuid.UUID) error
-	MarkPaymentPaid(ctx context.Context, id uuid.UUID) error
-	MarkPaymentRefunded(ctx context.Context, id uuid.UUID) error
-	MarkFulfilled(ctx context.Context, id uuid.UUID, carrier, trackingNumber *string) error
-	MarkCancelled(ctx context.Context, id uuid.UUID) error
+	// Every mutation below is scoped by (tenant_id, id): the row is always
+	// reached from a caller that already knows the tenant, but the query
+	// defends itself too rather than relying solely on that caller.
+	AttachPayment(ctx context.Context, tenantID, id, paymentID uuid.UUID, method Method) error
+	MarkConfirmed(ctx context.Context, tenantID, id uuid.UUID) error
+	MarkPaymentPaid(ctx context.Context, tenantID, id uuid.UUID) error
+	// MarkPaymentFailed records a declined/cancelled payment. A no-op
+	// (ErrInvalidTransition) if payment_status isn't currently PENDING, so
+	// repeat delivery (webhook retry, or a client re-Pay after the async
+	// consumer already applied it) can't double-process.
+	MarkPaymentFailed(ctx context.Context, tenantID, id uuid.UUID) error
+	MarkPaymentRefunded(ctx context.Context, tenantID, id uuid.UUID) error
+	MarkFulfilled(ctx context.Context, tenantID, id uuid.UUID, carrier, trackingNumber *string) error
+	MarkCancelled(ctx context.Context, tenantID, id uuid.UUID) error
 }

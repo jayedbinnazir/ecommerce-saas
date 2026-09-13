@@ -48,8 +48,9 @@ func (r *ImageRepository) Create(ctx context.Context, img *domain.Image) error {
 	return nil
 }
 
-func (r *ImageRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Image, error) {
-	img, err := scanImage(r.db.QueryRowContext(ctx, `SELECT `+imageColumns+` FROM product_images WHERE id = $1`, id))
+func (r *ImageRepository) GetByID(ctx context.Context, productID, id uuid.UUID) (*domain.Image, error) {
+	const q = `SELECT ` + imageColumns + ` FROM product_images WHERE product_id = $1 AND id = $2`
+	img, err := scanImage(r.db.QueryRowContext(ctx, q, productID, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.ErrImageNotFound
 	}
@@ -76,8 +77,9 @@ func (r *ImageRepository) ListByProduct(ctx context.Context, productID uuid.UUID
 }
 
 func (r *ImageRepository) Update(ctx context.Context, img *domain.Image) error {
-	const q = `UPDATE product_images SET url = $2, alt = $3, position = $4 WHERE id = $1 RETURNING ` + imageColumns
-	updated, err := scanImage(r.db.QueryRowContext(ctx, q, img.ID, img.URL, img.Alt, img.Position))
+	const q = `UPDATE product_images SET url = $3, alt = $4, position = $5
+		WHERE id = $1 AND product_id = $2 RETURNING ` + imageColumns
+	updated, err := scanImage(r.db.QueryRowContext(ctx, q, img.ID, img.ProductID, img.URL, img.Alt, img.Position))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ErrImageNotFound
 	}
@@ -88,8 +90,8 @@ func (r *ImageRepository) Update(ctx context.Context, img *domain.Image) error {
 	return nil
 }
 
-func (r *ImageRepository) Delete(ctx context.Context, id uuid.UUID) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM product_images WHERE id = $1`, id)
+func (r *ImageRepository) Delete(ctx context.Context, productID, id uuid.UUID) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM product_images WHERE product_id = $1 AND id = $2`, productID, id)
 	if err != nil {
 		return err
 	}

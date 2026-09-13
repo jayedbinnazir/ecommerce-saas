@@ -73,5 +73,8 @@ type Repository interface {
 	GetByID(ctx context.Context, tenantID, id uuid.UUID) (*Payment, error)
 	GetByOrder(ctx context.Context, tenantID, orderID uuid.UUID) (*Payment, error)
 	GetByGatewayRef(ctx context.Context, ref string) (*Payment, error)
+	// GetByGatewayRefForUpdate is GetByGatewayRef with a row lock (SELECT ... FOR
+	// UPDATE) — used inside a transaction so webhook processing is atomic.
+	GetByGatewayRefForUpdate(ctx context.Context, ref string) (*Payment, error)
 	Update(ctx context.Context, p *Payment) error
 }

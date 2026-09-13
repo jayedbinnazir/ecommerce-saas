@@ -97,6 +97,7 @@ var (
 		paymentdomain.ErrPaymentExists,
 		paymentdomain.ErrNotRefundable,
 		paymentdomain.ErrNotSettleable,
+		paymentdomain.ErrNotCancellable,
 	}
 
 	validationErrors = []error{

@@ -5,6 +5,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/jayedbinnazir/order-service/internal/paymentclient"
 	"github.com/jayedbinnazir/order-service/internal/platform"
 	scdomain "github.com/jayedbinnazir/order-service/internal/storeconfig/domain"
+	storeconfigrepo "github.com/jayedbinnazir/order-service/internal/storeconfig/repository"
 	storeconfig "github.com/jayedbinnazir/order-service/internal/storeconfig/services"
 )
 
@@ -146,7 +148,23 @@ func (s *Service) Checkout(ctx context.Context, tenantID, customerID uuid.UUID, 
 	}
 	items := orderItems(orderID, cart.Lines)
 
-	if err := s.repo.Create(ctx, order, items); err != nil {
+	// Redeeming the coupon (if any) runs inside the SAME transaction as the
+	// order insert, so the two can't drift apart: a coupon that got exhausted
+	// by a concurrent checkout between the quote above and now rolls this
+	// order back entirely (no discount without a real redemption), and a
+	// failed order insert never touches the coupon's counter.
+	var couponID *uuid.UUID
+	if quote.CouponID != nil {
+		couponID = quote.CouponID
+	}
+	redeem := func(tx *sql.Tx) error {
+		if couponID == nil {
+			return nil
+		}
+		return storeconfigrepo.New(tx).Redeem(ctx, *couponID)
+	}
+
+	if err := s.repo.Create(ctx, order, items, redeem); err != nil {
 		_ = s.inventory.Release(ctx, tenantID, orderID.String(), lines)
 		if platform.IsUniqueViolation(err, "orders_idempotency_key") {
 			existing, gerr := s.repo.GetByIdempotencyKey(ctx, tenantID, customerID, idempotencyKey)
@@ -156,13 +174,7 @@ func (s *Service) Checkout(ctx context.Context, tenantID, customerID uuid.UUID, 
 			d, derr := s.detail(ctx, tenantID, existing.ID)
 			return d, false, derr
 		}
-		return nil, false, err
-	}
-
-	if quote.CouponID != nil {
-		if rerr := s.storeconfig.RedeemCoupon(ctx, *quote.CouponID); rerr != nil {
-			log.Printf("[order] coupon %s redeem after order %s: %v", *quote.CouponID, order.ID, rerr)
-		}
+		return nil, false, err // e.g. storeconfig.ErrCouponExhausted — the whole order rolled back
 	}
 
 	_ = s.cart.Clear(ctx, rawToken, tenantID) // best effort
@@ -279,7 +291,7 @@ func (s *Service) Pay(ctx context.Context, tenantID, customerID uuid.UUID, rawTo
 			Method:      string(method),
 		})
 		if err == nil {
-			if attachErr := s.repo.AttachPayment(ctx, order.ID, payment.ID, domain.Method(payment.Method)); attachErr != nil {
+			if attachErr := s.repo.AttachPayment(ctx, tenantID, order.ID, payment.ID, domain.Method(payment.Method)); attachErr != nil {
 				return nil, attachErr
 			}
 		}
@@ -289,12 +301,20 @@ func (s *Service) Pay(ctx context.Context, tenantID, customerID uuid.UUID, rawTo
 	}
 
 	if payment.Method == string(domain.MethodCOD) || payment.Status == "CAPTURED" {
-		if err := s.advanceToConfirmed(ctx, order); err != nil {
+		if err := s.advanceToConfirmed(ctx, tenantID, order); err != nil {
 			return nil, err
 		}
 	}
 	if payment.Status == "CAPTURED" {
-		_ = s.repo.MarkPaymentPaid(ctx, order.ID)
+		_ = s.repo.MarkPaymentPaid(ctx, tenantID, order.ID)
+	}
+	if payment.Status == "FAILED" {
+		// Release whatever Checkout reserved so a declined card doesn't hold
+		// stock forever. MarkPaymentFailed is guarded (only fires once, from
+		// PENDING), so a repeated Pay/Sync call here is a safe no-op.
+		if err := s.releaseOnPaymentFailure(ctx, tenantID, order.ID); err != nil {
+			log.Printf("[order] release reservation for failed payment on order %s: %v", order.ID, err)
+		}
 	}
 
 	detail, err := s.detail(ctx, tenantID, order.ID)
@@ -309,11 +329,107 @@ func (s *Service) Pay(ctx context.Context, tenantID, customerID uuid.UUID, rawTo
 
 // advanceToConfirmed moves a PENDING_PAYMENT order to CONFIRMED, tolerating an
 // order that is already past that point (idempotent Pay calls).
-func (s *Service) advanceToConfirmed(ctx context.Context, order *domain.Order) error {
+func (s *Service) advanceToConfirmed(ctx context.Context, tenantID uuid.UUID, order *domain.Order) error {
 	if order.Status != domain.StatusPendingPayment {
 		return nil
 	}
-	return s.repo.MarkConfirmed(ctx, order.ID)
+	return s.repo.MarkConfirmed(ctx, tenantID, order.ID)
+}
+
+// releaseOnPaymentFailure marks the order's payment FAILED — a no-op once
+// payment_status has moved off PENDING, so repeat delivery can't reprocess it
+// — and, only when the order is still PENDING_PAYMENT, releases the stock
+// Checkout reserved for it. If the order was already CANCELLED, Cancel()
+// already released that stock; releasing again here would double-release the
+// same units back into availability, so this is skipped for any order not
+// still in PENDING_PAYMENT.
+func (s *Service) releaseOnPaymentFailure(ctx context.Context, tenantID, orderID uuid.UUID) error {
+	order, err := s.repo.GetByID(ctx, tenantID, orderID)
+	if err != nil {
+		if errors.Is(err, domain.ErrOrderNotFound) {
+			return nil
+		}
+		return err
+	}
+	if err := s.repo.MarkPaymentFailed(ctx, tenantID, orderID); err != nil {
+		if errors.Is(err, domain.ErrInvalidTransition) {
+			return nil // already handled (paid/refunded/already-failed) — nothing to release again
+		}
+		return err
+	}
+	if order.Status != domain.StatusPendingPayment {
+		return nil // e.g. already CANCELLED — its stock was released by Cancel()
+	}
+	items, err := s.repo.ListItems(ctx, orderID)
+	if err != nil {
+		return err
+	}
+	return s.inventory.Release(ctx, tenantID, orderID.String(), stockLinesFromItems(items))
+}
+
+// ---------------------------------------------------------------------
+// Kafka-driven sync — keeps the order in step with a webhook-driven payment
+// capture/failure even if the customer never returns to call Pay again.
+// ---------------------------------------------------------------------
+
+// ApplyPaymentCaptured confirms and marks an order paid from a payment.captured
+// event. Idempotent: a repeat delivery (or one that races an in-browser Pay
+// call) finds the order already past PENDING_PAYMENT/PENDING and no-ops.
+//
+// If the order was CANCELLED before this capture was known about — a
+// cancel-then-delayed-webhook race, which Cancel() defends against by voiding
+// the PaymentIntent, but Stripe can still lose that race — the order is never
+// resurrected to CONFIRMED. Instead the capture is recorded (money really did
+// move) and immediately reversed through the existing refund path, exactly as
+// if a manager had refunded a paid order.
+func (s *Service) ApplyPaymentCaptured(ctx context.Context, tenantID, orderID uuid.UUID) error {
+	order, err := s.repo.GetByID(ctx, tenantID, orderID)
+	if errors.Is(err, domain.ErrOrderNotFound) {
+		return nil // stale/foreign event — nothing to apply
+	}
+	if err != nil {
+		return err
+	}
+
+	switch order.Status {
+	case domain.StatusPendingPayment, domain.StatusConfirmed:
+		wasConfirmed := order.Status == domain.StatusConfirmed
+		if err := s.advanceToConfirmed(ctx, tenantID, order); err != nil {
+			return err
+		}
+		if err := s.repo.MarkPaymentPaid(ctx, tenantID, orderID); err != nil && !errors.Is(err, domain.ErrInvalidTransition) {
+			return err
+		}
+		if wasConfirmed {
+			return nil // this event didn't change anything — don't re-publish
+		}
+		detail, err := s.detail(ctx, tenantID, orderID)
+		if err != nil {
+			return err
+		}
+		s.publishOrder(ctx, &detail.Order, events.OrderConfirmed)
+		return nil
+
+	case domain.StatusCancelled:
+		if order.PaymentID == nil {
+			return nil
+		}
+		_ = s.repo.MarkPaymentPaid(ctx, tenantID, orderID) // record the real capture (idempotent guard)
+		if _, err := s.payments.Refund(ctx, tenantID, *order.PaymentID, nil); err != nil {
+			return err // retried by the consumer
+		}
+		_ = s.repo.MarkPaymentRefunded(ctx, tenantID, orderID)
+		return nil
+
+	default: // FULFILLED — already fully settled, nothing left to change
+		return nil
+	}
+}
+
+// ApplyPaymentFailed releases the order's reserved stock from a payment.failed
+// event. Idempotent via releaseOnPaymentFailure's own guards.
+func (s *Service) ApplyPaymentFailed(ctx context.Context, tenantID, orderID uuid.UUID) error {
+	return s.releaseOnPaymentFailure(ctx, tenantID, orderID)
 }
 
 // Fulfil marks a CONFIRMED order FULFILLED and ships the reserved stock, storing
@@ -330,7 +446,7 @@ func (s *Service) Fulfil(ctx context.Context, tenantID uuid.UUID, rawToken strin
 	if err != nil {
 		return nil, err
 	}
-	if err := s.repo.MarkFulfilled(ctx, order.ID, trim(req.Carrier), trim(req.TrackingNumber)); err != nil {
+	if err := s.repo.MarkFulfilled(ctx, tenantID, order.ID, trim(req.Carrier), trim(req.TrackingNumber)); err != nil {
 		return nil, err
 	}
 	if err := s.inventory.Ship(ctx, tenantID, order.ID.String(), stockLinesFromItems(items)); err != nil {
@@ -339,7 +455,7 @@ func (s *Service) Fulfil(ctx context.Context, tenantID uuid.UUID, rawToken strin
 
 	if order.PaymentID != nil && order.PaymentStatus == string(domain.PaymentPending) {
 		if _, err := s.payments.Settle(ctx, tenantID, *order.PaymentID); err == nil {
-			_ = s.repo.MarkPaymentPaid(ctx, order.ID)
+			_ = s.repo.MarkPaymentPaid(ctx, tenantID, order.ID)
 		}
 	}
 
@@ -362,7 +478,7 @@ func (s *Service) Cancel(ctx context.Context, tenantID, customerID uuid.UUID, ra
 	if err != nil {
 		return nil, err
 	}
-	if err := s.repo.MarkCancelled(ctx, order.ID); err != nil {
+	if err := s.repo.MarkCancelled(ctx, tenantID, order.ID); err != nil {
 		return nil, err
 	}
 	if err := s.inventory.Release(ctx, tenantID, order.ID.String(), stockLinesFromItems(items)); err != nil {
@@ -370,10 +486,23 @@ func (s *Service) Cancel(ctx context.Context, tenantID, customerID uuid.UUID, ra
 	}
 
 	refunded := false
-	if order.PaymentID != nil && order.PaymentStatus == string(domain.PaymentPaid) {
+	switch {
+	case order.PaymentID != nil && order.PaymentStatus == string(domain.PaymentPaid):
+		// Already captured — refund it (the existing refund path).
 		if _, err := s.payments.Refund(ctx, tenantID, *order.PaymentID, nil); err == nil {
-			_ = s.repo.MarkPaymentRefunded(ctx, order.ID)
+			_ = s.repo.MarkPaymentRefunded(ctx, tenantID, order.ID)
 			refunded = true
+		}
+	case order.PaymentID != nil && order.PaymentStatus == string(domain.PaymentPending) &&
+		order.PaymentMethod != nil && *order.PaymentMethod == string(domain.MethodCard):
+		// Not captured yet — void the Stripe PaymentIntent so a delayed
+		// capture can't land after the customer already cancelled. Best
+		// effort: if Stripe rejects the void (it already captured a moment
+		// earlier), the payment stays PENDING and ApplyPaymentCaptured will
+		// detect the order is CANCELLED when that webhook arrives and refund
+		// it automatically instead of resurrecting the order.
+		if _, err := s.payments.Cancel(ctx, tenantID, *order.PaymentID); err != nil {
+			log.Printf("[order] void pending payment for cancelled order %s: %v", order.ID, err)
 		}
 	}
 

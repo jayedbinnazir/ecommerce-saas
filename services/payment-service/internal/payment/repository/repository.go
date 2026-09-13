@@ -86,16 +86,30 @@ func (r *Repository) GetByGatewayRef(ctx context.Context, ref string) (*domain.P
 	return p, err
 }
 
+// GetByGatewayRefForUpdate is GetByGatewayRef with a row lock, so a webhook
+// handler can read-check-write the payment atomically inside a transaction —
+// concurrent deliveries of the same Stripe event serialize on this row instead
+// of racing past the same "already processed" check. gateway_ref has a unique
+// index (where not null), so this locks at most one row.
+func (r *Repository) GetByGatewayRefForUpdate(ctx context.Context, ref string) (*domain.Payment, error) {
+	const q = `SELECT ` + columns + ` FROM payments WHERE gateway_ref = $1 FOR UPDATE`
+	p, err := scan(r.db.QueryRowContext(ctx, q, ref))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrPaymentNotFound
+	}
+	return p, err
+}
+
 func (r *Repository) Update(ctx context.Context, p *domain.Payment) error {
 	const q = `
 		UPDATE payments
-		SET status = $2, gateway_ref = $3, client_secret = $4,
-		    captured_at = $5, refunded_at = $6, refunded_cents = $7
-		WHERE id = $1
+		SET status = $3, gateway_ref = $4, client_secret = $5,
+		    captured_at = $6, refunded_at = $7, refunded_cents = $8
+		WHERE id = $1 AND tenant_id = $2
 		RETURNING ` + columns
 
 	updated, err := scan(r.db.QueryRowContext(ctx, q,
-		p.ID, p.Status, p.GatewayRef, p.ClientSecret, p.CapturedAt, p.RefundedAt, p.RefundedCents))
+		p.ID, p.TenantID, p.Status, p.GatewayRef, p.ClientSecret, p.CapturedAt, p.RefundedAt, p.RefundedCents))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ErrPaymentNotFound
 	}

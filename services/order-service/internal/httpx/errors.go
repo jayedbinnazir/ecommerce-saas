@@ -127,6 +127,7 @@ var (
 		returnsdomain.ErrOrderNotReturnable,
 		returnsdomain.ErrInvalidReturnItems,
 		returnsdomain.ErrNoReturnItems,
+		returnsdomain.ErrReturnQuantityExceeded,
 	}
 
 	unauthorizedErrors = []error{

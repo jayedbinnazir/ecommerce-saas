@@ -60,9 +60,9 @@ func (r *VariantRepository) Create(ctx context.Context, v *domain.Variant) error
 	return nil
 }
 
-func (r *VariantRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Variant, error) {
-	const q = `SELECT ` + variantColumns + ` FROM product_variants WHERE id = $1`
-	v, err := scanVariant(r.db.QueryRowContext(ctx, q, id))
+func (r *VariantRepository) GetByID(ctx context.Context, tenantID, id uuid.UUID) (*domain.Variant, error) {
+	const q = `SELECT ` + variantColumns + ` FROM product_variants WHERE tenant_id = $1 AND id = $2`
+	v, err := scanVariant(r.db.QueryRowContext(ctx, q, tenantID, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.ErrVariantNotFound
 	}
@@ -97,14 +97,14 @@ func (r *VariantRepository) CountByProduct(ctx context.Context, productID uuid.U
 func (r *VariantRepository) Update(ctx context.Context, v *domain.Variant) error {
 	const q = `
 		UPDATE product_variants SET
-			sku = $2, title = $3, price_cents = $4, currency = $5,
-			compare_at_price_cents = $6, weight_grams = $7, barcode = $8,
-			position = $9, is_default = $10
-		WHERE id = $1
+			sku = $3, title = $4, price_cents = $5, currency = $6,
+			compare_at_price_cents = $7, weight_grams = $8, barcode = $9,
+			position = $10, is_default = $11
+		WHERE id = $1 AND tenant_id = $2
 		RETURNING ` + variantColumns
 
 	updated, err := scanVariant(r.db.QueryRowContext(ctx, q,
-		v.ID, v.SKU, v.Title, v.PriceCents, v.Currency,
+		v.ID, v.TenantID, v.SKU, v.Title, v.PriceCents, v.Currency,
 		v.CompareAtPriceCents, v.WeightGrams, v.Barcode, v.Position, v.IsDefault,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -120,16 +120,17 @@ func (r *VariantRepository) Update(ctx context.Context, v *domain.Variant) error
 	return nil
 }
 
-func (r *VariantRepository) Delete(ctx context.Context, id uuid.UUID) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM product_variants WHERE id = $1`, id)
+func (r *VariantRepository) Delete(ctx context.Context, tenantID, id uuid.UUID) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM product_variants WHERE tenant_id = $1 AND id = $2`, tenantID, id)
 	if err != nil {
 		return err
 	}
 	return platform.AffectedOrNotFound(res, domain.ErrVariantNotFound)
 }
 
-func (r *VariantRepository) ClearDefault(ctx context.Context, productID uuid.UUID) error {
+func (r *VariantRepository) ClearDefault(ctx context.Context, tenantID, productID uuid.UUID) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE product_variants SET is_default = false WHERE product_id = $1 AND is_default`, productID)
+		`UPDATE product_variants SET is_default = false WHERE tenant_id = $1 AND product_id = $2 AND is_default`,
+		tenantID, productID)
 	return err
 }

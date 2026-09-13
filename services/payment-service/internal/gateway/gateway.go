@@ -48,6 +48,12 @@ type Gateway interface {
 	GetIntent(ctx context.Context, id string) (*Intent, error)
 	// Refund reverses a payment. amountCents nil = full refund.
 	Refund(ctx context.Context, intentID string, amountCents *int64) error
+	// Cancel voids a PaymentIntent that hasn't captured yet (e.g. the order was
+	// cancelled while still PENDING_PAYMENT). Stripe rejects this if the intent
+	// already succeeded — the caller should treat that as "too late" rather
+	// than force local state to match, and let the normal capture webhook
+	// reconcile it instead.
+	Cancel(ctx context.Context, intentID string) error
 	// VerifyWebhook checks the Stripe-Signature header and returns the event type
 	// and the PaymentIntent id the event concerns.
 	VerifyWebhook(payload []byte, signatureHeader string) (eventType, intentID string, err error)
@@ -83,6 +89,8 @@ func (stub) GetIntent(_ context.Context, id string) (*Intent, error) {
 }
 
 func (stub) Refund(_ context.Context, _ string, _ *int64) error { return nil }
+
+func (stub) Cancel(_ context.Context, _ string) error { return nil }
 
 func (stub) VerifyWebhook([]byte, string) (string, string, error) {
 	return "", "", ErrWebhookUnsupported
@@ -131,6 +139,10 @@ func (s *stripe) Refund(ctx context.Context, intentID string, amountCents *int64
 		form.Set("amount", strconv.FormatInt(*amountCents, 10))
 	}
 	return s.do(ctx, http.MethodPost, "/refunds", form, nil)
+}
+
+func (s *stripe) Cancel(ctx context.Context, intentID string) error {
+	return s.do(ctx, http.MethodPost, "/payment_intents/"+url.PathEscape(intentID)+"/cancel", url.Values{}, nil)
 }
 
 func (s *stripe) VerifyWebhook(payload []byte, signatureHeader string) (string, string, error) {

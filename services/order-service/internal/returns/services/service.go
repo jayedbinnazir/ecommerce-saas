@@ -52,12 +52,25 @@ func (s *Service) Request(ctx context.Context, tenantID, customerID, orderID uui
 		bySKU[strings.ToLower(it.SKU)] = it
 	}
 
+	// One query for every SKU already covered by a pending or completed return
+	// on this order, so a second request can't push the total returned past
+	// what was actually ordered (a rejected return doesn't count — rejecting
+	// one frees its quantity back up).
+	alreadyReturned, err := s.repo.AlreadyReturnedBySKU(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+
 	items := make([]domain.Item, 0, len(req.Items))
 	var suggested int64
 	for _, in := range req.Items {
-		oi, ok := bySKU[strings.ToLower(strings.TrimSpace(in.SKU))]
+		sku := strings.ToLower(strings.TrimSpace(in.SKU))
+		oi, ok := bySKU[sku]
 		if !ok || in.Quantity > oi.Quantity {
 			return nil, domain.ErrInvalidReturnItems
+		}
+		if alreadyReturned[sku]+in.Quantity > oi.Quantity {
+			return nil, domain.ErrReturnQuantityExceeded
 		}
 		items = append(items, domain.Item{
 			SKU:            oi.SKU,
@@ -147,7 +160,7 @@ func (s *Service) Resolve(ctx context.Context, tenantID uuid.UUID, rawToken stri
 	}
 
 	if !req.Approve {
-		if err := s.repo.Resolve(ctx, returnID, domain.StatusRejected, trim(req.Note), 0, false); err != nil {
+		if err := s.repo.Resolve(ctx, tenantID, returnID, domain.StatusRejected, trim(req.Note), 0, false); err != nil {
 			return nil, err
 		}
 		return s.reload(ctx, tenantID, returnID)
@@ -166,7 +179,7 @@ func (s *Service) Resolve(ctx context.Context, tenantID uuid.UUID, rawToken stri
 		if _, err := s.payments.Refund(ctx, tenantID, *order.PaymentID, &refundCents); err != nil {
 			return nil, err // paymentclient.ErrRejected / ErrUpstream -> httpx maps
 		}
-		_ = s.orders.MarkPaymentRefunded(ctx, order.ID) // best-effort mirror
+		_ = s.orders.MarkPaymentRefunded(ctx, tenantID, order.ID) // best-effort mirror
 	}
 
 	restocked := false
@@ -180,7 +193,7 @@ func (s *Service) Resolve(ctx context.Context, tenantID uuid.UUID, rawToken stri
 		}
 	}
 
-	if err := s.repo.Resolve(ctx, returnID, domain.StatusCompleted, trim(req.Note), refundCents, restocked); err != nil {
+	if err := s.repo.Resolve(ctx, tenantID, returnID, domain.StatusCompleted, trim(req.Note), refundCents, restocked); err != nil {
 		return nil, err
 	}
 	return s.reload(ctx, tenantID, returnID)

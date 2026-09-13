@@ -20,8 +20,10 @@ import (
 
 // Register mounts /tenants/:tenantId/orders[...]. Every route needs a valid
 // access token. A customer sees and acts on their own orders; a tenant
-// ADMIN/MANAGER can list all (?scope=all), read any, and fulfil.
-func Register(rg *gin.RouterGroup, db *sql.DB, cart *cartclient.Client, inventory *inventoryclient.Client, payments *paymentclient.Client, cfg *storeconfig.Service, publisher *events.Publisher, authzClient *authz.Client, guards httpx.Guards) {
+// ADMIN/MANAGER can list all (?scope=all), read any, and fulfil. Returns the
+// wired service so the caller can also drive it from the payment-events Kafka
+// consumer (see internal/order.EventHandler).
+func Register(rg *gin.RouterGroup, db *sql.DB, cart *cartclient.Client, inventory *inventoryclient.Client, payments *paymentclient.Client, cfg *storeconfig.Service, publisher *events.Publisher, authzClient *authz.Client, guards httpx.Guards) *services.Service {
 	svc := services.New(repository.New(db), cart, inventory, payments, cfg, publisher, authzClient)
 	h := httphandler.New(svc)
 
@@ -34,4 +36,5 @@ func Register(rg *gin.RouterGroup, db *sql.DB, cart *cartclient.Client, inventor
 		orders.POST("/:orderId/cancel", h.Cancel)
 		orders.POST("/:orderId/fulfil", h.Fulfil)
 	}
+	return svc
 }

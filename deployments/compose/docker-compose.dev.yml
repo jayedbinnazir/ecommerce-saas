@@ -60,6 +60,9 @@ services:
       # payment-service (subscription gate for store creation)
       USER_PAYMENT_SERVICE_URL: ${USER_PAYMENT_SERVICE_URL}
       USER_PAYMENT_INTERNAL_KEY: ${USER_PAYMENT_INTERNAL_KEY}
+      # mail-service (forgot-password email)
+      USER_MAIL_SERVICE_URL: ${USER_MAIL_SERVICE_URL}
+      USER_MAIL_INTERNAL_KEY: ${USER_MAIL_INTERNAL_KEY}
       # key OTHER services use to call user-management's /api/v1/internal (e.g. mail-service)
       USER_INTERNAL_KEY: ${USER_INTERNAL_KEY}
 
@@ -495,7 +498,7 @@ services:
   # MINIO (S3-compatible object storage for dev)
   # ============================================================
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
 
     container_name: ecommerce-minio
 
@@ -526,7 +529,7 @@ services:
 
   # one-shot: create the product-images bucket and make it publicly readable
   minio-setup:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
 
     container_name: ecommerce-minio-setup
 

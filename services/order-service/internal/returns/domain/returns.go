@@ -66,5 +66,9 @@ type Repository interface {
 	List(ctx context.Context, f ListFilter) ([]Return, error)
 	// ItemsByReturnIDs fetches items for many returns in one query (no N+1).
 	ItemsByReturnIDs(ctx context.Context, returnIDs []uuid.UUID) (map[uuid.UUID][]Item, error)
-	Resolve(ctx context.Context, id uuid.UUID, status Status, note *string, refundCents int64, restocked bool) error
+	// AlreadyReturnedBySKU sums, per SKU, the quantity already covered by a
+	// non-rejected return (REQUESTED or COMPLETED) on this order — one query,
+	// used so a new return request can't push the total past what was ordered.
+	AlreadyReturnedBySKU(ctx context.Context, orderID uuid.UUID) (map[string]int, error)
+	Resolve(ctx context.Context, tenantID, id uuid.UUID, status Status, note *string, refundCents int64, restocked bool) error
 }

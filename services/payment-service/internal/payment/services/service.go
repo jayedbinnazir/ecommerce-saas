@@ -5,6 +5,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,20 +17,23 @@ import (
 	"github.com/jayedbinnazir/payment-service/internal/gateway"
 	"github.com/jayedbinnazir/payment-service/internal/payment/domain"
 	"github.com/jayedbinnazir/payment-service/internal/payment/dto"
+	"github.com/jayedbinnazir/payment-service/internal/payment/repository"
+	"github.com/jayedbinnazir/payment-service/internal/platform"
 )
 
 // ErrGateway wraps any failure talking to Stripe. httpx maps it to 502.
 var ErrGateway = errors.New("payment gateway error")
 
 type Service struct {
+	db     *sql.DB // held so HandleWebhook can run inside a locked transaction
 	repo   domain.Repository
 	gw     gateway.Gateway
 	events *events.Publisher
 	authz  *authz.Client
 }
 
-func New(repo domain.Repository, gw gateway.Gateway, publisher *events.Publisher, authzClient *authz.Client) *Service {
-	return &Service{repo: repo, gw: gw, events: publisher, authz: authzClient}
+func New(db *sql.DB, repo domain.Repository, gw gateway.Gateway, publisher *events.Publisher, authzClient *authz.Client) *Service {
+	return &Service{db: db, repo: repo, gw: gw, events: publisher, authz: authzClient}
 }
 
 // publish emits a payment event consumed by notification-service (in-app) and
@@ -147,6 +151,36 @@ func (s *Service) Settle(ctx context.Context, tenantID, id uuid.UUID) (*domain.P
 	return p, nil
 }
 
+// Cancel voids a payment that hasn't captured yet — used when an order is
+// cancelled while still PENDING_PAYMENT, so a delayed Stripe capture can't
+// land after the fact. Only a PENDING payment can be cancelled (a CAPTURED one
+// must go through Refund instead — this never touches money that already moved).
+// If Stripe rejects the void (e.g. it already captured a moment earlier), the
+// payment is left PENDING and the error is returned: the caller (order-service)
+// treats this as best-effort and the eventual capture webhook will detect the
+// order is cancelled and refund it instead (see order/services.ApplyPaymentCaptured).
+func (s *Service) Cancel(ctx context.Context, tenantID, id uuid.UUID) (*domain.Payment, error) {
+	p, err := s.repo.GetByID(ctx, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if p.Status != domain.StatusPending {
+		return nil, domain.ErrNotCancellable
+	}
+
+	if p.Method == domain.MethodCard && p.GatewayRef != nil {
+		if err := s.gw.Cancel(ctx, *p.GatewayRef); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrGateway, err)
+		}
+	}
+
+	p.Status = domain.StatusFailed
+	if err := s.repo.Update(ctx, p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
 // Refund reverses a captured payment. amountCents nil = the full remaining
 // amount; a smaller value is a partial refund (used for returns), after which
 // the payment stays CAPTURED with refunded_cents > 0.
@@ -183,28 +217,60 @@ func (s *Service) Refund(ctx context.Context, tenantID, id uuid.UUID, amountCent
 
 // HandleWebhook advances a payment from a verified Stripe event. Unknown events
 // and payments we don't own are ignored.
+// HandleWebhook applies a verified Stripe event to the matching payment.
+//
+// The read-check-write is wrapped in one DB transaction with the payment row
+// locked (SELECT ... FOR UPDATE), so two genuinely concurrent deliveries of the
+// same event (Stripe retries, or the same event hitting two replicas) can't
+// both pass the "still PENDING" guard and both capture/publish — the second
+// transaction blocks on the lock, then sees the first's committed change and
+// no-ops. The Kafka publish happens only after the transaction commits, and
+// only on the delivery that actually made the change, so it can't double-fire.
 func (s *Service) HandleWebhook(ctx context.Context, eventType, intentID string) error {
-	p, err := s.repo.GetByGatewayRef(ctx, intentID)
-	if errors.Is(err, domain.ErrPaymentNotFound) {
+	var (
+		captured, failed bool
+		p                *domain.Payment
+	)
+	err := platform.RunInTx(ctx, s.db, func(tx *sql.Tx) error {
+		txRepo := repository.New(tx)
+
+		loaded, err := txRepo.GetByGatewayRefForUpdate(ctx, intentID)
+		if errors.Is(err, domain.ErrPaymentNotFound) {
+			return nil // unknown/foreign PaymentIntent — ignore, ack the webhook
+		}
+		if err != nil {
+			return err
+		}
+		if loaded.Status != domain.StatusPending {
+			return nil // already processed (this event or a later one) — no-op
+		}
+
+		switch eventType {
+		case "payment_intent.succeeded":
+			loaded.MarkCaptured()
+			if err := txRepo.Update(ctx, loaded); err != nil {
+				return err
+			}
+			captured = true
+		case "payment_intent.payment_failed", "payment_intent.canceled":
+			loaded.Status = domain.StatusFailed
+			if err := txRepo.Update(ctx, loaded); err != nil {
+				return err
+			}
+			failed = true
+		}
+		p = loaded
 		return nil
-	}
+	})
 	if err != nil {
 		return err
 	}
-	if p.Status != domain.StatusPending {
-		return nil
-	}
-	switch eventType {
-	case "payment_intent.succeeded":
-		p.MarkCaptured()
-		if err := s.repo.Update(ctx, p); err != nil {
-			return err
-		}
+
+	switch {
+	case captured:
 		s.publish(ctx, p, events.PaymentCaptured)
-		return nil
-	case "payment_intent.payment_failed", "payment_intent.canceled":
-		p.Status = domain.StatusFailed
-		return s.repo.Update(ctx, p)
+	case failed:
+		s.publish(ctx, p, events.PaymentFailed)
 	}
 	return nil
 }

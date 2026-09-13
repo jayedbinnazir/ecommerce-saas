@@ -1,0 +1,44 @@
+user_service:
+  host: "localhost"
+  port: "8080"
+  mode: debug
+
+database:
+  host: postgres
+  port: "5432"
+  name: user_management_db
+  dbssl: false
+  max_open_connections: 25
+  max_idle_connections: 10
+  connection_max_lifetime: 30m
+
+redis:
+  host: redis
+  port: "6379"
+
+kafka:
+  brokers:
+    - kafka:9092
+
+jwt:
+  secret: "dev-secret-not-for-production"
+  expires: 24h
+  access_ttl: 15m
+  refresh_ttl: 168h
+
+auth:
+  frontend_url: "http://localhost:3000"
+  cookie_domain: ""
+  cookie_secure: false
+  google:
+    redirect_url: "http://localhost:8080/api/v1/auth/google/callback"
+  facebook:
+    redirect_url: "http://localhost:8080/api/v1/auth/facebook/callback"
+
+services:
+  payment_service_url: "http://payment-service:8080"
+  payment_internal_key: "dev-internal-key"
+  mail_service_url: "http://mail-service:8080"
+  mail_internal_key: "dev-internal-key"
+
+internal_key: "dev-internal-key"

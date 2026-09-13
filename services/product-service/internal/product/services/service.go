@@ -200,7 +200,7 @@ func (s *Service) AddVariant(ctx context.Context, tenantID, productID uuid.UUID,
 
 		repo := repository.NewVariantRepository(tx)
 		if variant.IsDefault {
-			if err := repo.ClearDefault(ctx, productID); err != nil {
+			if err := repo.ClearDefault(ctx, tenantID, productID); err != nil {
 				return err
 			}
 		}
@@ -230,18 +230,18 @@ func (s *Service) UpdateVariant(ctx context.Context, tenantID, productID, varian
 	err := platform.RunInTx(ctx, s.db, func(tx *sql.Tx) error {
 		repo := repository.NewVariantRepository(tx)
 
-		variant, err := repo.GetByID(ctx, variantID)
+		variant, err := repo.GetByID(ctx, tenantID, variantID)
 		if err != nil {
 			return err
 		}
-		if variant.ProductID != productID || variant.TenantID != tenantID {
+		if variant.ProductID != productID {
 			return domain.ErrVariantNotInProduct
 		}
 
 		applyVariantPatch(variant, req)
 
 		if variant.IsDefault {
-			if err := repo.ClearDefault(ctx, productID); err != nil {
+			if err := repo.ClearDefault(ctx, tenantID, productID); err != nil {
 				return err
 			}
 		}
@@ -273,14 +273,14 @@ func (s *Service) UpdateVariant(ctx context.Context, tenantID, productID, varian
 
 func (s *Service) DeleteVariant(ctx context.Context, tenantID, productID, variantID uuid.UUID) error {
 	repo := repository.NewVariantRepository(s.db)
-	variant, err := repo.GetByID(ctx, variantID)
+	variant, err := repo.GetByID(ctx, tenantID, variantID)
 	if err != nil {
 		return err
 	}
-	if variant.ProductID != productID || variant.TenantID != tenantID {
+	if variant.ProductID != productID {
 		return domain.ErrVariantNotInProduct
 	}
-	return repo.Delete(ctx, variantID)
+	return repo.Delete(ctx, tenantID, variantID)
 }
 
 // ---------------------------------------------------------------------
@@ -365,12 +365,9 @@ func (s *Service) UpdateImage(ctx context.Context, tenantID, productID, imageID 
 	}
 
 	repo := repository.NewImageRepository(s.db)
-	img, err := repo.GetByID(ctx, imageID)
+	img, err := repo.GetByID(ctx, productID, imageID)
 	if err != nil {
 		return nil, err
-	}
-	if img.ProductID != productID {
-		return nil, domain.ErrImageNotFound
 	}
 
 	if req.Alt != nil {
@@ -392,14 +389,11 @@ func (s *Service) DeleteImage(ctx context.Context, tenantID, productID, imageID 
 		return err
 	}
 	repo := repository.NewImageRepository(s.db)
-	img, err := repo.GetByID(ctx, imageID)
+	img, err := repo.GetByID(ctx, productID, imageID)
 	if err != nil {
 		return err
 	}
-	if img.ProductID != productID {
-		return domain.ErrImageNotFound
-	}
-	if err := repo.Delete(ctx, imageID); err != nil {
+	if err := repo.Delete(ctx, productID, imageID); err != nil {
 		return err
 	}
 	// Best-effort: the row is gone; a leftover object is harmless.
