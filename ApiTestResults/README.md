@@ -951,3 +951,499 @@ legitimate owner and seller-initiated paths aren't over-blocked.
 ./...` clean (no test files). Both containers force-recreated; confirmed clean
 boot (`order-service consuming payment-events`), zero panics/fatals across the
 full cancellation test session.
+
+## Subscription lifecycle — implementation + real API verification (2026-09-11)
+
+### What already existed (unchanged)
+
+Subscription billing (module `billing`, table `subscriptions` + `plans`, all in
+payment-service) was already real, not a stub in the "fake API" sense — `GET
+/plans`, `GET/POST/DELETE /subscription`, and the internal `GET
+/internal/users/:userId/subscription` entitlement check user-management's
+tenant-creation gate calls were all wired and working. What was explicitly
+**stubbed by design** (per the file's own header comment) is the *charge*:
+`Subscribe` never touches a payment gateway — it just records `current_period
+= [now, now+interval)` with `status = ACTIVE`. There is no
+`stripe_subscription_id`/`stripe_customer_id` column and the `Gateway`
+interface has no recurring-billing method — this is a manually-tracked "paid
+until X" model, not a real Stripe `Subscription` object. The tenant-creation
+gate itself (`user-management`'s `tenant/services.Create` →
+`SubscriptionGuard.RequireActiveSubscription` → payment-service's internal
+status route) was untouched and is preserved exactly as-is.
+
+States already declared: `ACTIVE`, `CANCELED`, `EXPIRED`, `PAST_DUE`
+(`billing/domain/billing.go`). Before this pass, only `ACTIVE`/`CANCELED` were
+ever assigned — `EXPIRED` and `PAST_DUE` were dead enum values; a lapsed
+subscription's `status` column stayed `ACTIVE` forever (entitlement was only
+ever evaluated *incidentally*, via `IsEntitled`'s `now.Before(period_end)`
+check), and — critically — this meant a lapsed subscription **could never be
+renewed**: `Subscribe` always `INSERT`ed a new row, and the DB's own
+`subscriptions_one_active_per_user` partial unique index (`WHERE status =
+'ACTIVE'`) rejected it because the old, lapsed-but-still-`ACTIVE` row was
+still occupying that slot. This was the actual root-cause bug closed by this
+pass — not a missing feature so much as an existing one-way door.
+
+### What was implemented
+
+1. **Lazy expiry** (no cron/worker exists anywhere in this system, and adding
+   one would be new infrastructure beyond scope) — every read of a user's
+   subscription now first runs a scoped, indexed `UPDATE subscriptions SET
+   status='EXPIRED' WHERE user_id=$1 AND status='ACTIVE' AND
+   current_period_end <= now()` before selecting. This makes the stored
+   `status` column agree with what `IsEntitled` already computed
+   incidentally, and — by flipping the row out of `ACTIVE` — frees the
+   partial unique index so the user can renew.
+2. **Renewal / reactivation, unified into the existing `POST /subscription`**
+   (no new billing architecture invented): the same endpoint now branches on
+   the caller's most recent subscription row (locked `FOR UPDATE` inside a
+   transaction):
+   - no subscription ever existed → create a fresh `ACTIVE` row (unchanged
+     behavior)
+   - `ACTIVE` and not yet lapsed → **renewal**: extend `current_period_end`
+     by one more interval *from the current end* (no paid-for time lost),
+     same row
+   - `CANCELED` / `EXPIRED` / `PAST_DUE` → **reactivate** that same row:
+     `ACTIVE` again, a fresh period starting now
+3. **Renewal idempotency**: an optional `Idempotency-Key` header (same
+   convention as order checkout's) is stored on the row as
+   `last_renewal_key`. A retried/duplicate renewal request carrying the same
+   key is a no-op (returns the already-renewed row unchanged) instead of
+   extending the period a second time. The row lock means two concurrent
+   requests with the same key serialize instead of racing.
+4. **Payment-failure grace state**: `POST
+   /internal/users/:userId/subscription/mark-past-due` (X-Internal-Key) flips
+   an `ACTIVE` subscription to `PAST_DUE` without touching
+   `current_period_end` or anything tenant-side. This is the entry point a
+   real Stripe `invoice.payment_failed` webhook would call once real
+   recurring billing exists — today it's invoked directly because
+   `Subscribe`/renew never performs a real charge that could fail on its own
+   (see "Remaining gaps" below).
+5. Two small schema/behavior additions: `subscriptions.last_renewal_key TEXT`
+   column (migration `000005_billing_renewal`); `SubscriptionRepository.Update`
+   now also persists `plan_id` (needed so renew-with-a-different-plan and
+   reactivate-with-a-plan both work).
+
+**Business-rule decision made explicit** (§6 of the task): this codebase
+already keeps subscription *entitlement* (`subscriptions.user_id`) and tenant
+*ownership/data* (`tenants.owner_id`, memberships, orders, products,
+inventory) as separate concepts, coupled only at the one-time
+tenant-creation gate — nothing else in the system re-checks the owner's
+subscription. That is preserved exactly: an existing tenant's data and
+day-to-day operations are **never** gated by its owner's subscription status,
+regardless of ACTIVE/PAST_DUE/EXPIRED/CANCELED. The *only* enforcement is,
+and remains, "no active subscription → can't create a (new) tenant." This
+was a deliberate choice not to add new enforcement — building a
+per-operation subscription check for existing tenants would be new
+architectural coupling this codebase doesn't have today, and the task
+explicitly said not to blindly block every API or destroy/restrict a working
+store over a personal billing lapse.
+
+### Files changed
+
+- `payment-service/migrations/000005_billing_renewal.{up,down}.sql` (new)
+- `payment-service/internal/billing/domain/billing.go` — `Subscription.LastRenewalKey`, `GetLatestByUserForUpdate` on the repository interface
+- `payment-service/internal/billing/repository/repository.go` — `expireLapsed`, `GetLatestByUserForUpdate`, `Update` now also sets `plan_id`
+- `payment-service/internal/billing/services/service.go` — `Service` gained a `db *sql.DB` field; `Subscribe` rewritten (transaction + row lock, renewal/reactivation/idempotency-key branching); new `MarkPastDue`
+- `payment-service/internal/billing/handler/http/handler.go` — `Subscribe` reads the `Idempotency-Key` header; new `InternalMarkPastDue`
+- `payment-service/internal/billing/routes/routes.go` — new internal route `POST /internal/users/:userId/subscription/mark-past-due`
+
+### API changes
+
+- `POST /api/v1/subscription` — same request/response shape; now also renews
+  or reactivates instead of only ever creating. Accepts an optional
+  `Idempotency-Key` header.
+- New: `POST /api/v1/internal/users/:userId/subscription/mark-past-due`
+  (X-Internal-Key) — payment-failure simulation, models what a real Stripe
+  `invoice.payment_failed` webhook would trigger.
+
+### Database changes
+
+`subscriptions.last_renewal_key TEXT` (nullable), migration `000005`, applied
+against the running `payment_db`.
+
+### Webhook/event changes
+
+None. Audited the existing Stripe webhook handler
+(`payment/services/service.go HandleWebhook`) — it only recognizes
+`payment_intent.succeeded` / `payment_intent.payment_failed` /
+`payment_intent.canceled`, all order-payment events; there is no
+`invoice.*`/`customer.subscription.*` handling because there is no real
+Stripe `Subscription` object for those events to describe. Per the task's own
+instruction ("do not invent a new webhook system... follow the existing
+manual-periods model"), no subscription-specific Stripe webhook handling was
+added. What *was* verified for real is that the existing webhook endpoint is
+safe against subscription-shaped events it doesn't understand — see Test 7
+below.
+
+### Real API scenarios executed (all against the live Docker stack)
+
+#### Test 1 — no subscription → tenant creation blocked
+
+```
+GET /api/v1/subscription (new user, never subscribed):  404 NOT_FOUND "no active subscription"
+POST /api/v1/tenants:                                     422 VALIDATION_ERROR
+  "an active subscription is required to create a store"
+```
+**PASS**
+
+#### Test 2 — subscribe → ACTIVE → tenant creation succeeds → creator is ADMIN
+
+```
+POST /api/v1/subscription {"plan_code":"starter-monthly"}:
+  201 {status: ACTIVE, current_period_start: 2026-09-11T11:34:20Z, current_period_end: 2026-10-11T11:34:20Z}
+POST /api/v1/tenants {"name":"First Shop", ...}:  201 {id, owner_user_id, status: ACTIVE}
+GET /api/v1/tenants/:id/members:  [{ user_id: <owner>, role_name: "ADMIN" }]
+```
+**PASS** — the pre-existing "subscribe → create tenant → creator = ADMIN"
+chain is completely unaffected by this pass.
+
+#### Test 3 — renewal extends the period; duplicate renewal does not double-extend
+
+```
+POST /subscription (same plan, Idempotency-Key: renew-key-X):
+  current_period_end: 2026-10-11T11:34:20Z -> 2026-11-11T11:34:20Z   (+1 month from the OLD end, not from "now")
+POST /subscription again, SAME Idempotency-Key:
+  current_period_end: 2026-11-11T11:34:20Z (unchanged -- no-op, same row returned)
+```
+**PASS** — renewal extends without losing paid time; the duplicate request
+(simulating a retried/duplicate renewal call) produced zero additional
+extension.
+
+#### Test 4 — renewal payment failure → PAST_DUE (grace state)
+
+```
+POST /internal/users/:userId/subscription/mark-past-due (X-Internal-Key):
+  200 {status: PAST_DUE, current_period_end: unchanged}
+GET /internal/users/:userId/subscription (the tenant-creation gate's own check):
+  200 {"active": false}
+POST /api/v1/tenants (new tenant, while PAST_DUE):
+  422 VALIDATION_ERROR "an active subscription is required to create a store"
+GET /api/v1/tenants/:TENANT1 (the EXISTING tenant created in Test 2):
+  200 -- unchanged, fully operational, no data touched
+GET /api/v1/tenants/:TENANT1/members:  200 -- membership untouched
+```
+**PASS** — new tenant creation correctly blocked; the already-existing tenant
+is completely unaffected (no destruction, no restriction), matching the
+business-rule decision above.
+
+#### Test 5 — renewing from PAST_DUE restores ACTIVE and unblocks tenant creation
+
+```
+POST /subscription {"plan_code":"starter-monthly"}:
+  201 {status: ACTIVE, current_period_start: <now>, current_period_end: <now+1mo>}
+POST /api/v1/tenants ("Second Shop"):  201 -- succeeds again
+```
+**PASS**
+
+#### Test 6 — expiration (period end reached) → EXPIRED, gated, data preserved, renewable
+
+Real elapsed time can't be waited out in this sandbox, so `current_period_end`
+was moved into the past directly in Postgres for this one subscription row
+(the same fault-injection technique used throughout the cancellation-lifecycle
+pass) to deterministically reach the "period has ended" state a real clock
+would eventually reach on its own:
+```
+UPDATE subscriptions SET current_period_end = now() - interval '1 day' WHERE id = '<sub1>'
+GET /api/v1/subscription (lazy-expiry runs on this read):
+  404 NOT_FOUND "no active subscription"
+DB: select status from subscriptions where id='<sub1>':  EXPIRED   <- flipped by the read, not just incidentally "not entitled"
+POST /api/v1/tenants ("Third Shop"):  422 VALIDATION_ERROR (blocked)
+GET /api/v1/tenants/:TENANT1:  200 -- still fully there, nothing destroyed
+POST /subscription (renew): 201 {status: ACTIVE, current_period_start: <now>, ...}  -- reactivated
+POST /api/v1/tenants ("Third Shop") again:  201 -- succeeds now that it's renewed
+```
+**PASS** — expiration never destroys tenant data, correctly blocks *new*
+tenant creation only, and is fully recoverable by renewing.
+
+#### Test 7 — subscription webhook safety (no subscription Stripe events exist, but the endpoint must stay safe)
+
+```
+signed "customer.subscription.updated" event (unrelated to any payment row):
+  HTTP 200 (looked up by its object id against `payments`, not found, safely ignored)
+same event delivered again (duplicate):
+  HTTP 200 (same safe no-op, idempotent by construction)
+same event with an invalid signature:
+  HTTP 401 UNAUTHORIZED "invalid Stripe signature"
+```
+**PASS** — confirms the existing (order-payment-only) webhook handler doesn't
+crash or mis-process a subscription-shaped Stripe event; signature
+verification and duplicate-delivery safety both hold for event types the
+system doesn't model, exactly as they do for the ones it does.
+
+#### Test 8 — cross-user safety
+
+```
+User B subscribes (starter-yearly), then cancels:
+  DELETE /subscription:  200 {status: CANCELED, plan_id: <yearly>}
+User A renews (independently, after A's own Test-7-style cancel):
+  POST /subscription:  201 {id: <A's own new row>, plan_id: <A's monthly plan>, status: ACTIVE}
+DB: subscriptions where user_id = A:  1 row, ACTIVE, A's own plan_id only
+```
+**PASS** — subscriptions are user-scoped in the schema (no tenant coupling at
+all); B's cancel and A's renew operated on entirely separate rows, confirmed
+via direct DB read.
+
+#### Regression — cancel/renew cycle didn't disturb CANCEL, and prior order flow still works
+
+```
+DELETE /subscription (Test-7-in-script cancel):  200 {status: CANCELED}
+POST /api/v1/tenants (new tenant while CANCELED):  422 (blocked, correct)
+GET /api/v1/tenants/:TENANT1:  200 (still fine)
+--- unrelated regression: fresh COD checkout end-to-end ---
+POST cart/items -> POST orders -> POST orders/:id/pay {"payment_method":"COD"}:
+  order status: PENDING_PAYMENT -> CONFIRMED, payment_status: PENDING (COD, correct pre-existing behavior)
+```
+**PASS** — the order-cancellation-lifecycle work from the previous pass and
+the base checkout flow are both unaffected by this session's billing changes.
+
+### Build/runtime verification
+
+`payment-service`: `gofmt -l` / `go build ./...` / `go vet ./...` clean (no
+test files). Migration `000005_billing_renewal` applied against the running
+`payment_db` (`go run ./cmd/migration up`, executed inside the container).
+Container force-recreated; confirmed clean boot (`payment-service listening
+on :8080`, new route `POST
+/api/v1/internal/users/:userId/subscription/mark-past-due` registered in the
+Gin route dump), zero panics/fatals across the full test session.
+
+### Remaining subscription-related gaps
+
+- **No real recurring Stripe billing.** This was a deliberate scope decision,
+  not an oversight — the task explicitly said to follow the existing manual-
+  periods model rather than invent a new billing architecture if that's what
+  the code already intentionally does, and this codebase's `Subscribe` has
+  been stubbed-charge by design since before this pass (`billing/services`
+  package doc comment). Real recurring billing would mean: a `Gateway`
+  method to create a Stripe `Subscription`/`price_id`, `stripe_subscription_id`
+  storage, and real `invoice.paid`/`invoice.payment_failed` webhook handling
+  replacing the internal `mark-past-due` stand-in used here. Flagged in
+  `GAP_ANALYSIS.md` as needing a product decision on scope; unchanged by this
+  pass.
+- `GET /subscription` (the caller's-own-subscription endpoint) only ever
+  surfaces `ACTIVE` rows (`404` otherwise) — this was pre-existing behavior
+  for `CANCELED` and is now equally true for `EXPIRED`/`PAST_DUE`. A real
+  product would likely want this endpoint to show "your subscription is
+  PAST_DUE / EXPIRED" rather than a bare 404; the internal entitlement route
+  (`.../subscription` with `X-Internal-Key`) already returns the real status
+  string correctly either way, so the tenant-creation gate itself is
+  unaffected — this is a minor UX gap in the customer-facing read, not a
+  correctness bug.
+- `DELETE /subscription` (Cancel) is still scoped to `ACTIVE` rows only (via
+  `GetActiveByUser`, pre-existing), so a `PAST_DUE` subscription can't be
+  directly canceled — it can only be renewed back to `ACTIVE` or left to
+  lapse to `EXPIRED`. Not exercised by the task's requirements; noted for
+  completeness.
+
+## Password / account security lifecycle — implementation + real API verification (2026-09-11)
+
+### What already existed (unchanged)
+
+Local email+password auth in user-management (`internal/auth`) was already
+solid: bcrypt password hashing, stateless HS256 JWT access tokens (15m),
+opaque refresh tokens hashed at rest with rotation + reuse detection
+(`refresh_tokens` table, family-based), and a Redis session store the
+`AuthGuard` checks on every request (so logout is instant on this service).
+What was completely missing, confirmed by `GAP_ANALYSIS.md` (`"no route, no
+service, no token table — does not exist at all"`): change-password,
+forgot-password, reset-password. There was also no "revoke every session for
+a user" capability anywhere — only revoke-by-id / revoke-by-family /
+revoke-by-session existed, all scoped to a single session.
+
+Also confirmed by inspection: user-management had no outbound Kafka
+publisher and no mail-service HTTP client at all (`internal/events` and
+`internal/infrastructure/kafka` are empty directories). mail-service is
+reached directly over HTTP by other services (notification-service already
+does this via its own `internal/mailclient` package hitting mail-service's
+`POST /internal/mail`, X-Internal-Key-guarded) — this is the existing,
+already-precedented integration pattern, not something invented for this
+task.
+
+### What was implemented
+
+1. **`password_reset_tokens` table** (migration `000011_password_reset`) —
+   single-use, short-lived (30 min), stored only as a SHA-256 hash, exactly
+   mirroring `refresh_tokens.token_hash`'s existing pattern. `used_at` is set
+   on consumption inside a `SELECT ... FOR UPDATE`-locked transaction (same
+   row-lock pattern payment-service's webhook handler already uses), so a
+   concurrent double-submit of the same token can't both succeed.
+2. **`RevokeAllForUser`** added to `RefreshTokenRepository` — revokes every
+   not-yet-revoked refresh token for a user (all devices/sessions) in one
+   statement and returns the distinct session ids, which the service then
+   deletes from Redis. This is the "revoke everywhere" primitive both
+   change-password and reset-password use; nothing like it existed before.
+3. **`POST /auth/change-password`** (authenticated) — requires the current
+   password, rejects a new password identical to the current one, hashes the
+   new one with the same bcrypt call `Register`/`Login` already use, then
+   revokes every session for that user (this one included — the handler also
+   clears the caller's own cookies, since their own access/refresh tokens are
+   now dead too).
+4. **`POST /auth/forgot-password`** (public) — always returns the same `200`
+   + generic message whether or not the email belongs to an account, or
+   whether it's an OAuth-only account with no password to reset. If it does
+   resolve to a real password-having user, a single-use token is created and
+   emailed via a new `internal/mailclient` package (byte-for-byte the same
+   client shape notification-service already uses against mail-service) and
+   a new `"password_reset"` template added to mail-service's existing
+   template registry — no new email infrastructure, reusing exactly what was
+   there.
+5. **`POST /auth/reset-password`** (public) — consumes the token
+   (lock-check-mark-used in one transaction), sets the new password, then
+   revokes every session for that user, the same as change-password.
+6. New downstream-service config for user-management:
+   `services.mail_service_url` / `services.mail_internal_key`
+   (`USER_MAIL_SERVICE_URL` / `USER_MAIL_INTERNAL_KEY`), mirroring the
+   existing `payment_service_url`/`payment_internal_key` pattern exactly.
+
+**Deliberate choice**: the reset-token value is never returned in any API
+response (that would let anyone reset anyone's password without ever
+touching their inbox). To verify the real end-to-end flow without a human
+checking an inbox, this session used **Mailpit** — the dev-only SMTP catcher
+already provisioned in `docker-compose.dev.yml` for exactly this purpose
+(`mail-service delivers here in dev; nothing leaves the machine`, per that
+file's own comment) — and read the real, delivered email's HTML body back
+via Mailpit's own REST API (`GET /api/v1/messages`, `GET
+/api/v1/message/:id`) to extract the real token, the same way a user would
+by opening the email. No log line, no test hook, no mock was added anywhere
+in the application code for this.
+
+### Files changed
+
+- `user-management/migrations/000011_password_reset.{up,down}.sql` (new)
+- `user-management/internal/auth/domain/{password_reset.go (new), errors.go, refresh_token.go}`
+- `user-management/internal/auth/repository/{password_reset_repository.go (new), refresh_repository.go}`
+- `user-management/internal/auth/services/auth_service.go` — `ChangePassword`, `RequestPasswordReset`, `ResetPassword`, `revokeAllSessions`; `Service`/`New(...)` gained `mail *mailclient.Client` + `frontendURL`
+- `user-management/internal/auth/handler/http/handler.go` — `ChangePassword`, `ForgotPassword`, `ResetPassword`
+- `user-management/internal/auth/routes/routes.go` — wires the mail client, mounts the 3 new routes
+- `user-management/internal/auth/dto/dto.go` — `ChangePasswordRequest`, `ForgotPasswordRequest`, `ResetPasswordRequest`
+- `user-management/internal/httpx/errors.go` — classifies the 3 new domain errors
+- `user-management/internal/mailclient/mailclient.go` (new) — mirrors `notification-service/internal/mailclient`
+- `user-management/internal/config/config.go` + `configs/config.dev.yaml` + `configs/config.yaml` — mail-service URL/key
+- `mail-service/internal/mail/templates/templates.go` — new `"password_reset"` template
+- `deployments/compose/docker-compose.dev.yml`, `.env.dev` — `USER_MAIL_SERVICE_URL`, `USER_MAIL_INTERNAL_KEY`
+
+### Database changes
+
+`password_reset_tokens` table (`user_id`, `token_hash` UNIQUE, `expires_at`,
+`used_at`, `created_at`), migration `000011`, applied against the running
+`user_management_db`.
+
+### API changes
+
+- `POST /api/v1/auth/change-password` (authenticated) — `{current_password, new_password}` → `204`
+- `POST /api/v1/auth/forgot-password` (public) — `{email}` → `200 {"message": "if that email is registered, a reset link has been sent"}`, always
+- `POST /api/v1/auth/reset-password` (public) — `{token, new_password}` → `204`
+
+### Webhook/event changes
+
+None — this flow doesn't touch Kafka or the Stripe webhook at all. The only
+new inter-service call is a direct, synchronous HTTP call from
+user-management to mail-service's existing `POST /internal/mail`, using the
+same client pattern notification-service already had in production.
+
+### Real API scenarios executed (all against the live Docker stack)
+
+#### A. change-password
+
+```
+A1. wrong current_password:              401 UNAUTHORIZED "current password is incorrect"
+A2. new_password == current password:    422 VALIDATION_ERROR "new password must be different from the current password"
+A3. no Authorization header:             401 UNAUTHORIZED "authentication required"
+A4. correct current + valid new:         204
+A5. login with the OLD password:         401 "invalid credentials"
+A6. login with the NEW password:         200, new tokens issued
+A7. the PRE-CHANGE access token on /auth/me:   401 "session is no longer valid"
+A8. the PRE-CHANGE refresh token on /auth/refresh: 401 "refresh token is invalid or expired"
+```
+**PASS** — current-password verification, reuse rejection, unauthenticated
+rejection, and full session invalidation (both the access token's Redis
+session and the refresh token) all confirmed for real.
+
+#### B. forgot-password / reset-password
+
+```
+B1. forgot-password, UNKNOWN email:   200 {"message":"if that email is registered, a reset link has been sent"}
+B2. forgot-password, KNOWN email:     200 {"message":"if that email is registered, a reset link has been sent"}   <- byte-identical to B1
+--- real email fetched from Mailpit ---
+Subject: "Reset your password"
+real token extracted from the email's own reset link: W5FsTJ-kWLD8j86Lmwl05r5Ix6TYvd9s8rGvC7m74T0
+B3. reset-password, a MADE-UP token:  400 BAD_REQUEST "invalid or expired reset token"
+B4. reset-password, the REAL token:   204
+B5. login with the OLD password:      401 "invalid credentials"
+B6. login with the NEW password:      200, new tokens issued
+B7. REUSE the same (now-consumed) token: 400 BAD_REQUEST "invalid or expired reset token"
+```
+**PASS** — unknown vs. known email produce an identical response (no account
+enumeration), the real single-use token round-tripped through a real email
+works exactly once, and a second use of the same token is rejected.
+
+#### B (part 2) — session revocation on reset, expired token, cross-user isolation
+
+```
+User C logs in FIRST (holds a pre-reset access+refresh token pair), THEN
+requests+uses a real reset token:
+  reset-password: 204
+  pre-reset access token on /auth/me:        401 "session is no longer valid"
+  pre-reset refresh token on /auth/refresh:  401 "refresh token is invalid or expired"
+
+EXPIRED token (forced via direct DB update on that one token's expires_at,
+the same fault-injection technique used throughout this whole test session --
+there's no way to wait out a real 30-minute TTL here):
+  reset-password with the expired token:  400 BAD_REQUEST "invalid or expired reset token"
+  user D's ORIGINAL password still works: 200   <- expired-token attempt had zero effect
+
+CROSS-USER: user C's new password works, user D's password is completely
+unaffected by C's (or anyone else's) reset — each token only ever resolves
+to the one user_id it was issued for.
+```
+**PASS** — reset-password revokes every existing session for the account
+(not just issuing a new one), an expired token is inert, and one user's
+reset can never touch another user's credentials.
+
+#### C. Regression — register/login/refresh/logout still work
+
+```
+register:            success
+login:                200
+refresh (rotation):   200, new pair issued
+logout:                204
+/auth/me after logout: 401 "session is no longer valid"
+```
+**PASS** — none of the existing auth lifecycle behavior changed.
+
+### Build/runtime verification
+
+`user-management` + `mail-service`: `gofmt -l` / `go build ./...` / `go vet
+./...` clean (no test files). Migration `000011_password_reset` applied
+against the running `user_management_db`
+(`docker exec user-management go run ./cmd/migration up`). Both containers
+force-recreated; confirmed clean boot (`user-management`: `Server is running
+on port 8080`, all 3 new routes present in the Gin route dump;
+`mail-service`: `mail-service listening on :8080`, `mail-service consuming
+order-events, payment-events` unchanged), zero panics/fatals across the full
+test session.
+
+### Remaining limitations / deliberate scope decisions
+
+- **Cross-service revocation is still access-token-TTL-bounded on every
+  *other* service.** Exactly as `GAP_ANALYSIS.md` already documented for
+  logout: revoking sessions on user-management is instant (Redis session
+  deleted, checked on every request to user-management itself), but a
+  leaked/already-issued access token for another service (order, product,
+  cart, inventory, payment, notification) is a stateless JWT those services
+  verify locally with no revocation check — it keeps working there until it
+  naturally expires (≤15 min). Password change/reset close this exposure on
+  user-management immediately and everywhere else within one access-token
+  TTL; making it instant everywhere would mean adding a shared revocation
+  check to every service's `AuthGuard` (a real architecture trade-off flagged
+  by the gap analysis as a follow-up decision, not something to silently
+  add here).
+- No password-history table — only the *current* password is checked for
+  reuse on change-password, per the task's own scope ("prevent reuse of the
+  current password", not a history). Not implemented for reset-password
+  (the requester has presumably forgotten their password, so there's nothing
+  meaningful to compare against beyond the current hash, which reset already
+  overwrites).
+- No rate-limiting was added to `forgot-password` specifically (the service
+  has no existing rate-limit middleware to hook into beyond the global one
+  already applied service-wide) — worth a follow-up if abuse becomes a
+  concern, not implemented here to avoid inventing new infrastructure.

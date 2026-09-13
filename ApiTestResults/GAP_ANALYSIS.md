@@ -30,7 +30,9 @@ real gaps cluster into a smaller, sharper set:
 1. **No cross-service session/token revocation** — logout is instant on
    user-management but a leaked access token still works on every other service
    until it naturally expires (≤15 min).
-2. **No password reset / change-password flow at all.**
+2. ✅ **DONE 2026-09-11** — ~~No password reset / change-password flow at
+   all~~ — implemented; see fix-order item 9 (§8) and
+   `ApiTestResults/README.md` § "Password / account security lifecycle".
 3. **Payment webhook has a genuine concurrency race** — no row lock, so two
    truly-concurrent deliveries of the same Stripe event can both pass the
    "already processed" guard and double-publish `payment.captured` (duplicate
@@ -54,9 +56,15 @@ real gaps cluster into a smaller, sharper set:
    requested for a SKU up to its *original order quantity* even if an earlier
    return for that SKU on the same order was already approved and refunded, and
    there's no de-dup against a REQUESTED-but-not-yet-resolved return either.
-6. **No subscription renewal or ongoing enforcement** — the active-subscription
-   check only ever runs once, at tenant-creation time; a tenant with a lapsed
-   subscription keeps operating forever, and there's no cron/webhook to renew.
+6. ✅ **DONE 2026-09-11** — ~~No subscription renewal or ongoing
+   enforcement~~ — renewal (with idempotent no-double-extend), a `PAST_DUE`
+   grace state for failed renewal charges, and lazy expiry are now
+   implemented; see fix-order item 11 (§8) and
+   `ApiTestResults/README.md` § "Subscription lifecycle". Ongoing
+   per-operation enforcement on an existing tenant after its owner's
+   subscription lapses was a deliberate **non**-change — see that section for
+   the reasoning (tenant-creation stays the only gate, matching this
+   codebase's existing separation of entitlement from tenant data).
 7. **Repository layer defense-in-depth gap (not a live exploit today)** — several
    mutation queries filter by `id` only, relying on the service layer to have
    pre-verified tenant ownership. Every currently-reachable HTTP path is safe,
@@ -436,14 +444,38 @@ cancelled order. Small, additive.
 8. **Product hard-delete guard** (§5, item 9) — block/require-force deleting a
    product that has order history, or switch the "delete" action to only ever
    archive.
-9. **Password reset / change-password flow** (§4.1) — new, real feature.
+9. ✅ **DONE 2026-09-11** — **Password reset / change-password flow** (§4.1).
+   Added `password_reset_tokens` (single-use, hashed, short-lived, same
+   pattern as `refresh_tokens`), `POST /auth/change-password`,
+   `POST /auth/forgot-password`, `POST /auth/reset-password`, and a
+   `RevokeAllForUser` primitive so both flows invalidate every session for
+   the account, not just issue new tokens. Email delivery reuses
+   mail-service's existing `/internal/mail` endpoint and template registry
+   (same client shape notification-service already had) — no new mail
+   infrastructure. Verified end-to-end for real, including the actual
+   delivered email (via the dev-only Mailpit catcher already in
+   `docker-compose.dev.yml`). See `ApiTestResults/README.md` §
+   "Password / account security lifecycle".
 10. **Idempotent-checkout release-leak fix** (§4.5) — make the compensating
     `inventory.Release` on a losing idempotency race retry-safe instead of
     fire-and-forget (or move both `Reserve`/loser-`Release` inside a pattern
     that can't silently drop the compensation).
-11. **Subscription renewal + ongoing enforcement decision** (§5, item 8) —
-    needs your call on scope (real Stripe subscription billing vs. a simpler
-    renew-by-calling-Subscribe-again UX) before implementation.
+11. ✅ **DONE 2026-09-11** — **Subscription renewal + ongoing enforcement**
+    (§5, item 8). Decision made: kept the existing manual-periods model
+    (renew-by-calling-`Subscribe`-again) rather than real Stripe recurring
+    billing — the codebase's own `Subscribe` was already an intentional
+    charge-stub. Closed the actual root-cause bug (a lapsed subscription's
+    `status` never flipped off `ACTIVE`, so the partial unique index silently
+    blocked all renewal forever); added lazy expiry, renewal/reactivation
+    with an `Idempotency-Key`-guarded no-double-extend path, and a
+    `PAST_DUE` grace state for a failed renewal charge (internal
+    `mark-past-due` endpoint standing in for a future real
+    `invoice.payment_failed` webhook). Ongoing enforcement decision: tenant
+    entitlement stays a one-time creation gate only — an existing tenant's
+    data/operations are never re-gated by the owner's subscription status,
+    matching this codebase's existing separation of subscription (user-scoped)
+    from tenant ownership/data. See `ApiTestResults/README.md` § "Subscription
+    lifecycle".
 12. Smaller items as time allows: per-user coupon limit, review
     purchase-eligibility (needs a design decision first), Kafka DLQ, order
     payment_status PARTIALLY_REFUNDED state, Stripe webhook timestamp-tolerance

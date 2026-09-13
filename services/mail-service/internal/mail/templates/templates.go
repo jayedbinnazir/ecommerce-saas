@@ -31,6 +31,13 @@ var registry = map[string]tmpl{
 		body: must(`<h2>Subscription active</h2>
 <p>Hi {{.name}}, your <strong>{{.plan_name}}</strong> plan is active until {{.period_end}}.</p>`),
 	},
+	"password_reset": {
+		subject: "Reset your password",
+		body: must(`<h2>Reset your password</h2>
+<p>Hi {{.name}}, we received a request to reset your password. This link expires in 30 minutes and can only be used once:</p>
+<p><a href="{{.reset_url}}">{{.reset_url}}</a></p>
+<p>If you didn't request this, you can safely ignore this email — your password won't change.</p>`),
+	},
 	"order_confirmation": {
 		subject: "Order {{.order_number}} received",
 		body: must(`<h2>Thanks for your order!</h2>
