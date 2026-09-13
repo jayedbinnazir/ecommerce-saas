@@ -448,3 +448,7 @@ cd services/<name> && go test ./...
 ```
 
 For an end-to-end check, bring the stack up (section 1) and walk section 3.
+
+
+
+//this is the end
