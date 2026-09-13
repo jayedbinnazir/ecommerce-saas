@@ -1,0 +1,8 @@
+server:
+  host: 0.0.0.0
+  port: 8081
+  mode: release
+database:
+  port: 5432
+  max_open_connections: 10
+  max_idle_connections: 5
