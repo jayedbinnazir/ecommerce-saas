@@ -1,6 +1,10 @@
+git clone https://github.com/jayedbinnazir/ecommerce-saas.git
+
+git switch second-branch
+
 copy all from .env.example to .env.dev
 
-download go
+download go from
 https://go.dev/dl/?utm_source=chatgpt.com 
 
 go version (check)
