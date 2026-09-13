@@ -498,7 +498,7 @@ services:
   # MINIO (S3-compatible object storage for dev)
   # ============================================================
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
 
     container_name: ecommerce-minio
 
@@ -529,7 +529,7 @@ services:
 
   # one-shot: create the product-images bucket and make it publicly readable
   minio-setup:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
 
     container_name: ecommerce-minio-setup
 
